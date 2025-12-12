@@ -403,6 +403,10 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                         print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
                     # save_every = SAVE_EVERY if SAVE_EVERY is not None else 1000
+
+                    if self.is_rank0 and verbose > 0 and self.step % 10 == 0:
+                        print("Step %d; loss (%f); current min loss (%f);"%(self.step, global_step_loss, self.min_loss))
+
                     save_every = 100
                     should_save = (self.step % save_every == 0)
                     # Prevent other ranks from progressing while rank0 is saving to avoid NCCL timeouts
