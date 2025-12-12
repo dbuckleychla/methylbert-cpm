@@ -117,10 +117,16 @@ class MethylBertTrainer(object):
         file_path: str
             model output path which gonna be file_path+"ep%d" % epoch
         '''
-        self.bert.to("cpu")
-        self.bert.save_pretrained(file_path)
-        self.bert.to(self.device)
+        # self.bert.to("cpu")
+        # self.bert.save_pretrained(file_path)
+        # self.bert.to(self.device)
+        # print("Step:%d Model Saved on:" % self.step, file_path)
+        to_save = self.bert
+        to_save_cpu = to_save.to("cpu")
+        to_save_cpu.save_pretrained(file_path)
+        to_save.to(self.device)
         print("Step:%d Model Saved on:" % self.step, file_path)
+
 
     def _setup_model(self):
         self.model = self.bert.to(self.device)
@@ -407,19 +413,19 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     if self.is_rank0 and verbose > 0 and self.step % 10 == 0:
                         print("Step %d; loss (%f); current min loss (%f);"%(self.step, global_step_loss, self.min_loss))
 
-                    save_every = 1
                     # Avoid saving (and hitting a barrier) at step 0; start after some progress
+                    save_every = 100
                     should_save = (self.step > 0 and self.step % save_every == 0)
-                    # Prevent other ranks from progressing while rank0 is saving to avoid NCCL timeouts
-                    if should_save and _ddp_enabled():
-                        dist.barrier()
+
+                    # No barriers here; only rank 0 saves
                     if self.is_rank0 and should_save and (self.min_loss > global_step_loss):
-                        print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
+                        print(
+                            "Step %d loss (%f) is lower than the current min loss (%f). "
+                            "Save the model at %s"
+                            % (self.step, global_step_loss, self.min_loss, self.save_path)
+                        )
                         self.save(self.save_path)
                         self.min_loss = global_step_loss
-                    if should_save and _ddp_enabled():
-                        dist.barrier()
-
                     # Save the step info (step, loss, lr, acc)
                     # with open(self.f_train, "a") as f_perform:
                     if self.is_rank0:
