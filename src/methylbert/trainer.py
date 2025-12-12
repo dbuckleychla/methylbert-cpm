@@ -425,7 +425,13 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     # save_every = SAVE_EVERY if SAVE_EVERY is not None else 1000
 
                     if self.is_rank0 and verbose > 0 and self.step % 10 == 0:
-                        print("Step %d; loss (%f); current min loss (%f);"%(self.step, global_step_loss, self.min_loss), flush=True)
+                        if self.step == 0: step_time = time.time()
+                        delta_time = time.time() - step_time
+                        time_per_step = delta_time / 10
+                        steps_remaining = steps - self.step
+                        eta = int((steps_remaining * time_per_step)/60)
+                        print("Step %d; loss (%f); current min loss (%f); time per step %f; Estimated time remaining (min): %f"%(self.step, global_step_loss, self.min_loss, time_per_step, eta), flush=True)
+                        step_time = time.time()
 
                     # Avoid saving (and hitting a barrier) at step 0; start after some progress
                     save_every = 100
