@@ -1,6 +1,7 @@
 import os
 import time
 import warnings
+from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -121,6 +122,17 @@ class MethylBertTrainer(object):
         self.bert.save_pretrained(file_path)
         self.bert.to(self.device)
         print("Step:%d Model Saved on:" % self.step, file_path)
+
+    def _barrier(self, tag: str):
+        """Synchronize ranks with a timeout so we fail fast instead of hanging indefinitely."""
+        if not _ddp_enabled():
+            return
+        try:
+            dist.barrier(timeout=timedelta(minutes=10))
+        except Exception as exc:
+            if self.is_rank0:
+                print(f"Barrier '{tag}' failed on rank0: {exc}")
+            raise
 
     def _setup_model(self):
         self.model = self.bert.to(self.device)
@@ -412,13 +424,17 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     should_save = (self.step > 0 and self.step % save_every == 0)
                     # Prevent other ranks from progressing while rank0 is saving to avoid NCCL timeouts
                     if should_save and _ddp_enabled():
-                        dist.barrier()
+                        if self.is_rank0:
+                            print(f"[ddp] entering pre-save barrier at step {self.step}")
+                        self._barrier("pre_save")
                     if self.is_rank0 and should_save and (self.min_loss > global_step_loss):
                         print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
                         self.save(self.save_path)
                         self.min_loss = global_step_loss
                     if should_save and _ddp_enabled():
-                        dist.barrier()
+                        if self.is_rank0:
+                            print(f"[ddp] entering post-save barrier at step {self.step}")
+                        self._barrier("post_save")
 
                     # Save the step info (step, loss, lr, acc)
                     # with open(self.f_train, "a") as f_perform:
