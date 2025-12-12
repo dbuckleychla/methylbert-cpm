@@ -407,7 +407,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     if self.is_rank0 and verbose > 0 and self.step % 10 == 0:
                         print("Step %d; loss (%f); current min loss (%f);"%(self.step, global_step_loss, self.min_loss))
 
-                    save_every = 100
+                    save_every = 1
                     # Avoid saving (and hitting a barrier) at step 0; start after some progress
                     should_save = (self.step > 0 and self.step % save_every == 0)
                     # Prevent other ranks from progressing while rank0 is saving to avoid NCCL timeouts
