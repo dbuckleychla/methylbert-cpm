@@ -338,10 +338,16 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
         duration = 0
         for epoch in range(epochs):
-            for i, batch in enumerate(data_loader):
-                # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items()}
 
+            # DDP: make DistributedSampler shuffle differently each epoch
+            if isinstance(data_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                data_loader.sampler.set_epoch(epoch)
+
+            for i, batch in enumerate(data_loader):
+                data = {
+                    k: (v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
                 start = time.time()
 
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
@@ -394,8 +400,9 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     if self.step % self._config.log_freq == 0:
                         print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
-
-                    if self.is_rank0 and self.min_loss > global_step_loss:
+                    if SAVE_EVERY is None: SAVE_EVERY = 1000
+                    should_save = (self.step % SAVE_EVERY == 0)
+                    if self.is_rank0 and should_save and (self.min_loss > global_step_loss):
                         print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
                         self.save(self.save_path)
                         self.min_loss = global_step_loss
