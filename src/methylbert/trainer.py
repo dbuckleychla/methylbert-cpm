@@ -408,7 +408,8 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                         print("Step %d; loss (%f); current min loss (%f);"%(self.step, global_step_loss, self.min_loss))
 
                     save_every = 100
-                    should_save = (self.step % save_every == 0)
+                    # Avoid saving (and hitting a barrier) at step 0; start after some progress
+                    should_save = (self.step > 0 and self.step % save_every == 0)
                     # Prevent other ranks from progressing while rank0 is saving to avoid NCCL timeouts
                     if should_save and _ddp_enabled():
                         dist.barrier()
