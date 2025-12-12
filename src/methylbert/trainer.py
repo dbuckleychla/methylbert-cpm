@@ -373,7 +373,18 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                 if "cuda" in self.device.type:
                     loss = loss.mean()
                 loss = loss/self._config.gradient_accumulation_steps
+                
+                if _ddp_enabled():
+                    x = torch.tensor(1, device=self.device)
+                    dist.all_reduce(x)
+                    if self.rank == 0 and self.step % 100 == 0:
+                        print(f"[heartbeat] step {self.step}")
+                
                 scaler.scale(loss).backward() if self._config.amp else loss.backward()
+                if _ddp_enabled() and self.step % 100 == 0:
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
                 global_step_loss += loss.item()
                 duration += time.time() - start
@@ -411,7 +422,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     # save_every = SAVE_EVERY if SAVE_EVERY is not None else 1000
 
                     if self.is_rank0 and verbose > 0 and self.step % 10 == 0:
-                        print("Step %d; loss (%f); current min loss (%f);"%(self.step, global_step_loss, self.min_loss))
+                        print("Step %d; loss (%f); current min loss (%f);"%(self.step, global_step_loss, self.min_loss), flush=True)
 
                     # Avoid saving (and hitting a barrier) at step 0; start after some progress
                     save_every = 100
@@ -419,6 +430,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
                     # No barriers here; only rank 0 saves
                     if self.is_rank0 and should_save and (self.min_loss > global_step_loss):
+                        print(f"[rank0] about to save at step={self.step}", flush=True)
                         print(
                             "Step %d loss (%f) is lower than the current min loss (%f). "
                             "Save the model at %s"
@@ -426,6 +438,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                         )
                         self.save(self.save_path)
                         self.min_loss = global_step_loss
+                        print(f"[rank0] finished save at step={self.step}", flush=True)
                     # Save the step info (step, loss, lr, acc)
                     # with open(self.f_train, "a") as f_perform:
                     if self.is_rank0:
