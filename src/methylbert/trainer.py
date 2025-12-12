@@ -400,7 +400,8 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     if self.step % self._config.log_freq == 0:
                         print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
-                    save_every = SAVE_EVERY if SAVE_EVERY is not None else 1000
+                    # save_every = SAVE_EVERY if SAVE_EVERY is not None else 1000
+                    save_every = 1000
                     should_save = (self.step % save_every == 0)
                     if self.is_rank0 and should_save and (self.min_loss > global_step_loss):
                         print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
