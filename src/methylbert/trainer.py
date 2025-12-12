@@ -299,21 +299,25 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         #     f_perform.write("step\ttest_acc\ttest_loss\n")
         
         # DDP patch DNB
+        # Only rank0 creates/resets metric files
         if self.is_rank0:
-            if os.path.exists(self.f_train):
-                os.remove(self.f_train)
-            with open(self.f_train, "a") as f_perform:
-                f_perform.write("step\tloss\tacc\tlr\n")
+            os.makedirs(self.save_path, exist_ok=True)
 
-            if os.path.exists(self.f_eval):
-                os.remove(self.f_eval)
-            with open(self.f_eval, "a") as f_perform:
-                f_perform.write("step\ttest_acc\ttest_loss\n")
+            for fp, header in [
+                (self.f_train, "step\tloss\tacc\tlr\n"),
+                (self.f_eval,  "step\ttest_acc\ttest_loss\n"),
+            ]:
+                try:
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except FileNotFoundError:
+                    pass
+                with open(fp, "w") as f:
+                    f.write(header)
 
+        # Everyone waits until files exist before training starts
         if _ddp_enabled():
             dist.barrier()
-
-
 
         # Set up a learning rate scheduler
         self.scheduler = learning_rate_scheduler(self.optim,
