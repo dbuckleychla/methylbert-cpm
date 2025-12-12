@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import (BertConfig, BertForMaskedLM,
                           BertForSequenceClassification)
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from methylbert.config import MethylBERTConfig, get_config
 from methylbert.data.vocab import MethylVocab
@@ -22,6 +24,13 @@ from methylbert.network import MethylBertEmbeddedDMR
 from methylbert.utils import get_dna_seq
 
 torch.set_warn_always(False) # one warning per process
+
+def _ddp_enabled():
+    return dist.is_available() and dist.is_initialized()
+
+def _is_torchrun():
+    return "RANK" in os.environ and "WORLD_SIZE" in os.environ and "LOCAL_RANK" in os.environ
+
 
 def learning_rate_scheduler(optimizer, num_warmup_steps: int, num_training_steps: int, decrease_steps: int):
     """
@@ -71,8 +80,26 @@ class MethylBertTrainer(object):
         if self._config.with_cuda and torch.cuda.device_count() < 1:
             print("No detected GPU device. Load the model on CPU")
             self._config.with_cuda = False
-        print("The model is loaded on %s"%("GPU" if self._config.with_cuda else "CPU"))
-        self.device = torch.device("cuda:0" if self._config.with_cuda else "cpu")
+        # print("The model is loaded on %s"%("GPU" if self._config.with_cuda else "CPU"))
+        # self.device = torch.device("cuda:0" if self._config.with_cuda else "cpu")
+        # DDP patch DNB
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+
+        # If launched with torchrun, initialize DDP
+        if self._config.with_cuda and _is_torchrun():
+            dist.init_process_group(backend="nccl")
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(self.local_rank)
+
+        print("The model is loaded on %s" % ("GPU" if self._config.with_cuda else "CPU"))
+        self.device = torch.device(f"cuda:{self.local_rank}" if self._config.with_cuda else "cpu")
+
+        # Convenience: only rank 0 should print/write files
+        self.is_rank0 = (self.rank == 0)
 
         # To save the best model
         self.min_loss = np.inf
@@ -96,22 +123,37 @@ class MethylBertTrainer(object):
         print("Step:%d Model Saved on:" % self.step, file_path)
 
     def _setup_model(self):
-        '''
-        Load the model to the designated device (CPU or GPU) and create an optimiser
-
-        '''
         self.model = self.bert.to(self.device)
-        print("Total Parameters:", sum([p.nelement() for p in self.model.parameters()]))
+        if self.is_rank0:
+            print("Total Parameters:", sum(p.nelement() for p in self.model.parameters()))
 
-        # Distributed GPU training if CUDA can detect more than 1 GPU
-        if self._config.with_cuda and torch.cuda.device_count() > 1:
-            print("Using %d GPUs for BERT" % torch.cuda.device_count())
-            self.model = nn.DataParallel(self.model)
+        # Wrap model for multi-GPU
+        if _ddp_enabled():
+            if self.is_rank0:
+                print(f"Using DDP: world_size={self.world_size}, local_rank={self.local_rank}")
+            self.model = DDP(
+                self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=False,
+            )
+        else:
+            if self._config.with_cuda and torch.cuda.device_count() > 1:
+                if self.is_rank0:
+                    print("Using %d GPUs for BERT (DataParallel fallback)" % torch.cuda.device_count())
+                self.model = nn.DataParallel(self.model)
 
+        # Optimizer (always create it for training)
         if not self._config.eval:
-            # Setting the AdamW optimizer with hyper-param
-            self.optim = AdamW(self.model.parameters(),
-                               lr=self._config.lr, betas=self._config.beta, eps=self._config.eps, weight_decay=self._config.weight_decay)
+            self.optim = AdamW(
+                self.model.parameters(),
+                lr=self._config.lr,
+                betas=self._config.beta,
+                eps=self._config.eps,
+                weight_decay=self._config.weight_decay,
+            )
+
 
     def train(self, steps: int = 0, verbose: int = 1):
         '''
@@ -244,17 +286,33 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         predict_res = {"prediction": [], "input": [], "label": []}
         self.step = 0
 
-        if os.path.exists(self.f_train):
-            os.remove(self.f_train)
+        # if os.path.exists(self.f_train):
+        #     os.remove(self.f_train)
 
-        with open(self.f_train, "a") as f_perform:
-            f_perform.write("step\tloss\tacc\tlr\n")
+        # with open(self.f_train, "a") as f_perform:
+        #     f_perform.write("step\tloss\tacc\tlr\n")
 
-        if os.path.exists(self.f_eval):
-            os.remove(self.f_eval)
+        # if os.path.exists(self.f_eval):
+        #     os.remove(self.f_eval)
 
-        with open(self.f_eval, "a") as f_perform:
-            f_perform.write("step\ttest_acc\ttest_loss\n")
+        # with open(self.f_eval, "a") as f_perform:
+        #     f_perform.write("step\ttest_acc\ttest_loss\n")
+        
+        # DDP patch DNB
+        if self.is_rank0:
+            if os.path.exists(self.f_train):
+                os.remove(self.f_train)
+            with open(self.f_train, "a") as f_perform:
+                f_perform.write("step\tloss\tacc\tlr\n")
+
+            if os.path.exists(self.f_eval):
+                os.remove(self.f_eval)
+            with open(self.f_eval, "a") as f_perform:
+                f_perform.write("step\ttest_acc\ttest_loss\n")
+
+        if _ddp_enabled():
+            dist.barrier()
+
 
 
         # Set up a learning rate scheduler
@@ -318,8 +376,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     self.model.zero_grad()
 
                     # Evaluation with both train and testdata
-                    if self.test_data is not None and self.step % self._config.eval_freq == 0 and self.step > 0:
-
+                    if self.is_rank0 and self.test_data is not None and self.step % self._config.eval_freq == 0 and self.step > 0:
                         test_pred, test_loss = self._eval_iteration(self.test_data)
                         idces = np.where(test_pred["label"]>=0)
                         test_pred_acc = self._acc(test_pred["prediction"][idces[0], idces[1]],
@@ -334,22 +391,24 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                         print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
 
-                    if self.min_loss > global_step_loss:
+                    if self.is_rank0 and self.min_loss > global_step_loss:
                         print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
                         self.save(self.save_path)
                         self.min_loss = global_step_loss
 
                     # Save the step info (step, loss, lr, acc)
-                    with open(self.f_train, "a") as f_perform:
+                    # with open(self.f_train, "a") as f_perform:
+                    if self.is_rank0:
+                        with open(self.f_train, "a") as f_perform:
 
-                        train_prediction_res["prediction"] = np.concatenate(train_prediction_res["prediction"], axis=0)
-                        train_prediction_res["label"] = np.concatenate(train_prediction_res["label"],  axis=0)
+                            train_prediction_res["prediction"] = np.concatenate(train_prediction_res["prediction"], axis=0)
+                            train_prediction_res["label"] = np.concatenate(train_prediction_res["label"],  axis=0)
 
-                        idces = np.where(train_prediction_res["label"]>=0)
-                        train_pred_acc = self._acc(train_prediction_res["prediction"][idces[0], idces[1]],
-                            train_prediction_res["label"][idces[0], idces[1]])
+                            idces = np.where(train_prediction_res["label"]>=0)
+                            train_pred_acc = self._acc(train_prediction_res["prediction"][idces[0], idces[1]],
+                                train_prediction_res["label"][idces[0], idces[1]])
 
-                        f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_pred_acc), str(self.optim.param_groups[0]["lr"])])+"\n")
+                            f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_pred_acc), str(self.optim.param_groups[0]["lr"])])+"\n")
 
                     self.step += 1
 
@@ -463,18 +522,20 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         """
 
         self.step = 0
+        if self.is_rank0:
+            if os.path.exists(self.f_train):
+                os.remove(self.f_train)
 
-        if os.path.exists(self.f_train):
-            os.remove(self.f_train)
+            with open(self.f_train, "w") as f_perform:
+                f_perform.write("step\tloss\tctype_acc\tlr\n")
 
-        with open(self.f_train, "w") as f_perform:
-            f_perform.write("step\tloss\tctype_acc\tlr\n")
+            if os.path.exists(self.f_eval):
+                os.remove(self.f_eval)
 
-        if os.path.exists(self.f_eval):
-            os.remove(self.f_eval)
-
-        with open(self.f_eval, "w") as f_perform:
-            f_perform.write("step\tloss\tctype_acc\n")
+            with open(self.f_eval, "w") as f_perform:
+                f_perform.write("step\tloss\tctype_acc\n")
+        if _ddp_enabled():
+            dist.barrier()
 
 
         # Set up a learning rate scheduler
@@ -578,14 +639,15 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                         self.save(step_save_dir)
 
                     # Save the step info (step, loss, lr, acc)
-                    with open(self.f_train, "a") as f_perform:
+                    if self.is_rank0:
+                        with open(self.f_train, "a") as f_perform:
 
-                        train_prediction_res["dmr_label"] = np.concatenate(train_prediction_res["dmr_label"],  axis=0)
-                        train_prediction_res["pred_ctype_label"] = np.concatenate(train_prediction_res["pred_ctype_label"], axis=0)
-                        train_prediction_res["ctype_label"] = np.concatenate(train_prediction_res["ctype_label"],  axis=0)
-                        train_ctype_acc = self._acc(train_prediction_res["pred_ctype_label"], train_prediction_res["ctype_label"])
+                            train_prediction_res["dmr_label"] = np.concatenate(train_prediction_res["dmr_label"],  axis=0)
+                            train_prediction_res["pred_ctype_label"] = np.concatenate(train_prediction_res["pred_ctype_label"], axis=0)
+                            train_prediction_res["ctype_label"] = np.concatenate(train_prediction_res["ctype_label"],  axis=0)
+                            train_ctype_acc = self._acc(train_prediction_res["pred_ctype_label"], train_prediction_res["ctype_label"])
 
-                        f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_ctype_acc),  str(self.optim.param_groups[0]["lr"])])+"\n")
+                            f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_ctype_acc),  str(self.optim.param_groups[0]["lr"])])+"\n")
 
                     steps_progress_bar.set_postfix(eval_loss=eval_loss)
                     # Reset prediction result
