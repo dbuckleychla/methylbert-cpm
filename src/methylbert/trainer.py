@@ -342,6 +342,8 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
             # DDP: make DistributedSampler shuffle differently each epoch
             if isinstance(data_loader.sampler, torch.utils.data.distributed.DistributedSampler):
                 data_loader.sampler.set_epoch(epoch)
+            if self.is_rank0 and verbose > 0:
+                print(f"Epoch {epoch+1}/{epochs}")
 
             for i, batch in enumerate(data_loader):
                 data = {
@@ -401,7 +403,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                         print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                         print(f"Running time for iter = {duration}")
                     # save_every = SAVE_EVERY if SAVE_EVERY is not None else 1000
-                    save_every = 1000
+                    save_every = 100
                     should_save = (self.step % save_every == 0)
                     # Prevent other ranks from progressing while rank0 is saving to avoid NCCL timeouts
                     if should_save and _ddp_enabled():
