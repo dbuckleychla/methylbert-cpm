@@ -403,10 +403,15 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     # save_every = SAVE_EVERY if SAVE_EVERY is not None else 1000
                     save_every = 1000
                     should_save = (self.step % save_every == 0)
+                    # Prevent other ranks from progressing while rank0 is saving to avoid NCCL timeouts
+                    if should_save and _ddp_enabled():
+                        dist.barrier()
                     if self.is_rank0 and should_save and (self.min_loss > global_step_loss):
                         print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, global_step_loss, self.min_loss, self.save_path))
                         self.save(self.save_path)
                         self.min_loss = global_step_loss
+                    if should_save and _ddp_enabled():
+                        dist.barrier()
 
                     # Save the step info (step, loss, lr, acc)
                     # with open(self.f_train, "a") as f_perform:
