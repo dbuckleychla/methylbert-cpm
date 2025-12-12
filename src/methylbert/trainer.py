@@ -121,11 +121,14 @@ class MethylBertTrainer(object):
         # self.bert.save_pretrained(file_path)
         # self.bert.to(self.device)
         # print("Step:%d Model Saved on:" % self.step, file_path)
-        to_save = self.bert
-        to_save_cpu = to_save.to("cpu")
-        to_save_cpu.save_pretrained(file_path)
-        to_save.to(self.device)
-        print("Step:%d Model Saved on:" % self.step, file_path)
+        # pick the underlying module (DDP wraps it)
+        model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
+
+        # build a CPU state_dict without moving the live model off GPU
+        state_dict = {k: v.detach().cpu() for k, v in model_to_save.state_dict().items()}
+
+        model_to_save.save_pretrained(file_path, state_dict=state_dict)
+        print(f"Step:{self.step} Model Saved on: {file_path}", flush=True)
 
 
     def _setup_model(self):
@@ -374,11 +377,11 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     loss = loss.mean()
                 loss = loss/self._config.gradient_accumulation_steps
                 
-                if _ddp_enabled():
-                    x = torch.tensor(1, device=self.device)
-                    dist.all_reduce(x)
-                    if self.rank == 0 and self.step % 100 == 0:
-                        print(f"[heartbeat] step {self.step}")
+                # if _ddp_enabled():
+                #     x = torch.tensor(1, device=self.device)
+                #     dist.all_reduce(x)
+                #     if self.rank == 0 and self.step % 100 == 0:
+                #         print(f"[heartbeat] step {self.step}")
                 
                 scaler.scale(loss).backward() if self._config.amp else loss.backward()
                 if _ddp_enabled() and self.step % 100 == 0:
@@ -429,16 +432,21 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
                     should_save = (self.step > 0 and self.step % save_every == 0)
 
                     # No barriers here; only rank 0 saves
+                    save_every = 100
+                    should_save = (self.step > 0 and self.step % save_every == 0)
+
+                    # IMPORTANT: decide should_save on ALL ranks using the same condition
+                    if _ddp_enabled() and should_save:
+                        dist.barrier()  # everyone arrives here together
+
                     if self.is_rank0 and should_save and (self.min_loss > global_step_loss):
                         print(f"[rank0] about to save at step={self.step}", flush=True)
-                        print(
-                            "Step %d loss (%f) is lower than the current min loss (%f). "
-                            "Save the model at %s"
-                            % (self.step, global_step_loss, self.min_loss, self.save_path)
-                        )
                         self.save(self.save_path)
                         self.min_loss = global_step_loss
                         print(f"[rank0] finished save at step={self.step}", flush=True)
+
+                    if _ddp_enabled() and should_save:
+                        dist.barrier()  # nobody starts next step until save is done
                     # Save the step info (step, loss, lr, acc)
                     # with open(self.f_train, "a") as f_perform:
                     if self.is_rank0:
@@ -661,7 +669,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
                     del eval_pred
 
-                    if self.step % self._config.log_freq == 0:
+                    if self.is_rank0 and self.step % self._config.log_freq == 0:
                         if verbose > 0:
                             print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
                             print(f"Running time for iter = {duration}")
