@@ -89,7 +89,9 @@ class MethylBertTrainer(object):
 
         # If launched with torchrun, initialize DDP
         if self._config.with_cuda and _is_torchrun():
-            dist.init_process_group(backend="nccl")
+            # Avoid double-initialization if the caller already set up DDP
+            if not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
             self.local_rank = int(os.environ["LOCAL_RANK"])
