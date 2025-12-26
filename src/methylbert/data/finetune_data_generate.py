@@ -178,7 +178,9 @@ def finetune_data_generate(
         ignore_sex_chromo: bool = True,
         methyl_caller: str = "bismark",
         verbose: int = 2,
-        read_extract_sequences_func: Optional[callable] = None
+        read_extract_sequences_func: Optional[callable] = None,
+        save_mode: str = "full",
+        output_compression: Optional[str] = None,
     ):
 
     # Setup random seed
@@ -198,10 +200,35 @@ def finetune_data_generate(
     else:
         split_ratios = [1.0, 0.0, 0.0] # output must be one single file
 
+    save_mode = save_mode.lower()
+    if save_mode not in ["full", "minimal"]:
+        raise ValueError("save_mode must be one of ['full', 'minimal']")
+
+    compression = None
+    compression_suffix = ""
+    if output_compression is not None:
+        compression_map = {
+            "gzip": "gzip",
+            "gz": "gzip",
+            "bz2": "bz2",
+            "xz": "xz",
+        }
+        compression_key = output_compression.lower()
+        if compression_key not in compression_map:
+            raise ValueError("output_compression must be one of ['gzip', 'bz2', 'xz']")
+        compression = compression_map[compression_key]
+        compression_suffix = {
+            "gzip": ".gz",
+            "bz2": ".bz2",
+            "xz": ".xz",
+        }[compression]
+
     # Setup output files
     if not os.path.exists(output_dir):
         os.mkdir(output_dir)
     fp_dmr = os.path.join(output_dir, "dmrs.csv") # File to save selected DMRs
+    def _with_compression_suffix(path: str) -> str:
+        return f"{path}{compression_suffix}" if compression_suffix else path
 
     # Reference genome
     record_iter = SeqIO.parse(f_ref, "fasta")
@@ -373,10 +400,20 @@ def finetune_data_generate(
         print("Total sequences per cell type")
         print(df_reads["ctype"].value_counts())
 
+    columns_to_save = None
+    if save_mode == "minimal":
+        columns_to_save = ["dna_seq", "methyl_seq", "ctype", "dmr_ctype", "dmr_label"]
+        missing_columns = [c for c in columns_to_save if c not in df_reads.columns]
+        if missing_columns:
+            raise ValueError(f"Missing required columns for minimal output: {missing_columns}")
+
+    def _select_save_columns(df: pd.DataFrame) -> pd.DataFrame:
+        return df if columns_to_save is None else df.loc[:, columns_to_save]
+
     # Split the data into train and train/valid/test by patient/bam file
     if split_ratios[0] != 1.0:
-        fp_train_seq = os.path.join(output_dir, "train_seq.csv")
-        fp_test_seq = os.path.join(output_dir, "test_seq.csv")
+        fp_train_seq = _with_compression_suffix(os.path.join(output_dir, "train_seq.csv"))
+        fp_test_seq = _with_compression_suffix(os.path.join(output_dir, "test_seq.csv"))
 
         split_key = "filename" if use_file_name else "name"
 
@@ -388,7 +425,7 @@ def finetune_data_generate(
         )
 
         if split_ratios[-1] > 0.0:
-            fp_val_seq = os.path.join(output_dir, "val_seq.csv")
+            fp_val_seq = _with_compression_suffix(os.path.join(output_dir, "val_seq.csv"))
             test_size = split_ratios[2] / (split_ratios[1] + split_ratios[2])
             val_files, test_files = train_test_split(
                 test_files,
@@ -396,23 +433,28 @@ def finetune_data_generate(
                 stratify=[files_lbl_map[e] for e in test_files]
             )
 
-            df_reads.loc[df_reads[split_key].isin(val_files), :] \
-            .to_csv(fp_val_seq, sep="\t", header=True, index=None)
+            _select_save_columns(df_reads.loc[df_reads[split_key].isin(val_files), :]) \
+                .to_csv(fp_val_seq, sep="\t", header=True, index=None, compression=compression)
         
         # Write train & test files (adding a final column because of sep="\t")
-        df_reads["non_null_col"] = ""
-        df_reads.loc[df_reads[split_key].isin(train_files), :] \
-            .to_csv(fp_train_seq, sep="\t", header=True, index=None)
-        df_reads.loc[df_reads[split_key].isin(test_files), :] \
-            .to_csv(fp_test_seq, sep="\t", header=True, index=None)
+        if save_mode == "full":
+            df_reads["non_null_col"] = ""
+
+        train_mask = df_reads[split_key].isin(train_files)
+        test_mask = df_reads[split_key].isin(test_files)
+
+        _select_save_columns(df_reads.loc[train_mask, :]) \
+            .to_csv(fp_train_seq, sep="\t", header=True, index=None, compression=compression)
+        _select_save_columns(df_reads.loc[test_mask, :]) \
+            .to_csv(fp_test_seq, sep="\t", header=True, index=None, compression=compression)
 
         if verbose > 0:
             print("Size - train %d seqs , valid %d seqs "% \
-                (df_reads.loc[df_reads[split_key].isin(train_files), :].shape[0],
-                 df_reads.loc[df_reads[split_key].isin(test_files), :].shape[0]))
+                (df_reads.loc[train_mask, :].shape[0],
+                 df_reads.loc[test_mask, :].shape[0]))
 
     else:
-        fp_data_seq = os.path.join(output_dir, "data.csv")
-        df_reads.to_csv(fp_data_seq, sep="\t", header=True, index=None)
+        fp_data_seq = _with_compression_suffix(os.path.join(output_dir, "data.csv"))
+        _select_save_columns(df_reads).to_csv(fp_data_seq, sep="\t", header=True, index=None, compression=compression)
 
     return df_reads

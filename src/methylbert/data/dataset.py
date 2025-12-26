@@ -1,4 +1,7 @@
+import bz2
 import gc
+import gzip
+import lzma
 import multiprocessing as mp
 import random
 from copy import deepcopy
@@ -10,6 +13,16 @@ import torch
 from torch.utils.data import Dataset
 
 from methylbert.data.vocab import MethylVocab
+
+
+def _open_text(path: str):
+	if path.endswith(".gz"):
+		return gzip.open(path, "rt")
+	if path.endswith(".bz2"):
+		return bz2.open(path, "rt")
+	if path.endswith(".xz"):
+		return lzma.open(path, "rt")
+	return open(path, "r")
 
 
 def _line2tokens_pretrain(l, tokenizer, max_len=120):
@@ -82,7 +95,7 @@ class MethylBertPretrainDataset(MethylBertDataset):
 		self.mask_list = self._get_mask()
 
 		# Read all text files and convert the raw sequence into tokens
-		with open(self.f_path, "r") as f_input:
+		with _open_text(self.f_path) as f_input:
 			print("Open data : %s"%f_input)
 			raw_seqs = f_input.read().splitlines()
 
@@ -231,7 +244,7 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		self.f_path = f_path
 
 		# Read all text files and convert the raw sequence into tokens
-		with open(self.f_path, "r") as f_input:
+		with _open_text(self.f_path) as f_input:
 			raw_seqs = f_input.read().splitlines()
 
 		# Check if there's a header
@@ -290,4 +303,3 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		item["methyl_seq"] = torch.cat((torch.tensor([2]), item["methyl_seq"]))
 
 		return item
-

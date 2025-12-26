@@ -97,6 +97,8 @@ def preprocess_finetune_arg_parser(subparsers):
 	parser.add_argument("-c", "--n_cores", type=int, default=1, help="number of cores for the multiprocessing (default: 1)")
 	parser.add_argument("--seed", type=int, default=950410, help="random seed number (default: 950410)")
 	parser.add_argument("--ignore_sex_chromo", default=False, action="store_true", help="Whether DMRs at sex chromosomes (chrX and chrY) will be ignored")
+	parser.add_argument("--save_mode", type=str, default="full", choices=["full", "minimal"], help="Save all read columns or only those required for fine-tuning (default: full)")
+	parser.add_argument("--output_compression", type=str, default=None, help="Optional compression for sequence outputs: gzip, bz2, xz (default: None)")
 
 def run_finetune(args):
 
@@ -246,7 +248,9 @@ def run_preprocess(args):
 			n_cores=args.n_cores,
 			seed=args.seed,
 			ignore_sex_chromo=args.ignore_sex_chromo,
-			methyl_caller=args.methylcaller
+			methyl_caller=args.methylcaller,
+			save_mode=args.save_mode,
+			output_compression=args.output_compression
 		)
 
 def write_args2json(args, f_out):
