@@ -98,7 +98,8 @@ def preprocess_finetune_arg_parser(subparsers):
 	parser.add_argument("--seed", type=int, default=950410, help="random seed number (default: 950410)")
 	parser.add_argument("--ignore_sex_chromo", default=False, action="store_true", help="Whether DMRs at sex chromosomes (chrX and chrY) will be ignored")
 	parser.add_argument("--save_mode", type=str, default="full", choices=["full", "minimal"], help="Save all read columns or only those required for fine-tuning (default: full)")
-	parser.add_argument("--output_compression", type=str, default=None, help="Optional compression for sequence outputs: gzip, bz2, xz (default: None)")
+	parser.add_argument("--output_compression", type=str, default=None, help="Optional compression for sequence outputs: gzip, bz2, xz (csv) or snappy, gzip, brotli, zstd, lz4 (parquet) (default: None)")
+	parser.add_argument("--output_format", type=str, default="csv", choices=["csv", "parquet"], help="Output format for sequences (default: csv)")
 
 def run_finetune(args):
 
@@ -215,7 +216,10 @@ def run_deconvolute(args):
 										test_dataloader=data_loader
 										)
 	
-	df_train = pd.read_csv(params["train_dataset"], sep="\t")
+	if params["train_dataset"].lower().endswith((".parquet", ".pq")):
+		df_train = pd.read_parquet(params["train_dataset"])
+	else:
+		df_train = pd.read_csv(params["train_dataset"], sep="\t")
 	n_dmrs = max(len(df_train["dmr_label"].unique()), 
 				 df_train["dmr_label"].max()+1 # same as 'def num_dmrs()' in data/dataset.py 
 				 )
@@ -250,7 +254,8 @@ def run_preprocess(args):
 			ignore_sex_chromo=args.ignore_sex_chromo,
 			methyl_caller=args.methylcaller,
 			save_mode=args.save_mode,
-			output_compression=args.output_compression
+			output_compression=args.output_compression,
+			output_format=args.output_format
 		)
 
 def write_args2json(args, f_out):

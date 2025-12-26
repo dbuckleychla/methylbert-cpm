@@ -181,6 +181,7 @@ def finetune_data_generate(
         read_extract_sequences_func: Optional[callable] = None,
         save_mode: str = "full",
         output_compression: Optional[str] = None,
+        output_format: str = "csv",
     ):
 
     # Setup random seed
@@ -204,24 +205,46 @@ def finetune_data_generate(
     if save_mode not in ["full", "minimal"]:
         raise ValueError("save_mode must be one of ['full', 'minimal']")
 
-    compression = None
+    output_format = output_format.lower()
+    if output_format not in ["csv", "parquet"]:
+        raise ValueError("output_format must be one of ['csv', 'parquet']")
+    if output_format == "parquet":
+        try:
+            import pyarrow  # noqa: F401
+        except ImportError as exc:
+            raise ImportError("pyarrow is required for parquet output. Install it with `pip install pyarrow`.") from exc
+
+    csv_compression = None
+    parquet_compression = None
     compression_suffix = ""
     if output_compression is not None:
-        compression_map = {
-            "gzip": "gzip",
-            "gz": "gzip",
-            "bz2": "bz2",
-            "xz": "xz",
-        }
         compression_key = output_compression.lower()
-        if compression_key not in compression_map:
-            raise ValueError("output_compression must be one of ['gzip', 'bz2', 'xz']")
-        compression = compression_map[compression_key]
-        compression_suffix = {
-            "gzip": ".gz",
-            "bz2": ".bz2",
-            "xz": ".xz",
-        }[compression]
+        if output_format == "csv":
+            compression_map = {
+                "gzip": "gzip",
+                "gz": "gzip",
+                "bz2": "bz2",
+                "xz": "xz",
+            }
+            if compression_key not in compression_map:
+                raise ValueError("output_compression must be one of ['gzip', 'bz2', 'xz'] for csv output")
+            csv_compression = compression_map[compression_key]
+            compression_suffix = {
+                "gzip": ".gz",
+                "bz2": ".bz2",
+                "xz": ".xz",
+            }[csv_compression]
+        else:
+            compression_map = {
+                "snappy": "snappy",
+                "gzip": "gzip",
+                "brotli": "brotli",
+                "zstd": "zstd",
+                "lz4": "lz4",
+            }
+            if compression_key not in compression_map:
+                raise ValueError("output_compression must be one of ['snappy', 'gzip', 'brotli', 'zstd', 'lz4'] for parquet output")
+            parquet_compression = compression_map[compression_key]
 
     # Setup output files
     if not os.path.exists(output_dir):
@@ -229,6 +252,18 @@ def finetune_data_generate(
     fp_dmr = os.path.join(output_dir, "dmrs.csv") # File to save selected DMRs
     def _with_compression_suffix(path: str) -> str:
         return f"{path}{compression_suffix}" if compression_suffix else path
+    def _output_path(base_name: str) -> str:
+        if output_format == "csv":
+            return _with_compression_suffix(os.path.join(output_dir, f"{base_name}.csv"))
+        return os.path.join(output_dir, f"{base_name}.parquet")
+    def _write_sequences(df: pd.DataFrame, path: str):
+        if output_format == "csv":
+            df.to_csv(path, sep="\t", header=True, index=None, compression=csv_compression)
+        else:
+            if output_compression is None:
+                df.to_parquet(path, index=False, engine="pyarrow")
+            else:
+                df.to_parquet(path, index=False, engine="pyarrow", compression=parquet_compression)
 
     # Reference genome
     record_iter = SeqIO.parse(f_ref, "fasta")
@@ -412,8 +447,8 @@ def finetune_data_generate(
 
     # Split the data into train and train/valid/test by patient/bam file
     if split_ratios[0] != 1.0:
-        fp_train_seq = _with_compression_suffix(os.path.join(output_dir, "train_seq.csv"))
-        fp_test_seq = _with_compression_suffix(os.path.join(output_dir, "test_seq.csv"))
+        fp_train_seq = _output_path("train_seq")
+        fp_test_seq = _output_path("test_seq")
 
         split_key = "filename" if use_file_name else "name"
 
@@ -425,7 +460,7 @@ def finetune_data_generate(
         )
 
         if split_ratios[-1] > 0.0:
-            fp_val_seq = _with_compression_suffix(os.path.join(output_dir, "val_seq.csv"))
+            fp_val_seq = _output_path("val_seq")
             test_size = split_ratios[2] / (split_ratios[1] + split_ratios[2])
             val_files, test_files = train_test_split(
                 test_files,
@@ -433,20 +468,17 @@ def finetune_data_generate(
                 stratify=[files_lbl_map[e] for e in test_files]
             )
 
-            _select_save_columns(df_reads.loc[df_reads[split_key].isin(val_files), :]) \
-                .to_csv(fp_val_seq, sep="\t", header=True, index=None, compression=compression)
+            _write_sequences(_select_save_columns(df_reads.loc[df_reads[split_key].isin(val_files), :]), fp_val_seq)
         
         # Write train & test files (adding a final column because of sep="\t")
-        if save_mode == "full":
+        if save_mode == "full" and output_format == "csv":
             df_reads["non_null_col"] = ""
 
         train_mask = df_reads[split_key].isin(train_files)
         test_mask = df_reads[split_key].isin(test_files)
 
-        _select_save_columns(df_reads.loc[train_mask, :]) \
-            .to_csv(fp_train_seq, sep="\t", header=True, index=None, compression=compression)
-        _select_save_columns(df_reads.loc[test_mask, :]) \
-            .to_csv(fp_test_seq, sep="\t", header=True, index=None, compression=compression)
+        _write_sequences(_select_save_columns(df_reads.loc[train_mask, :]), fp_train_seq)
+        _write_sequences(_select_save_columns(df_reads.loc[test_mask, :]), fp_test_seq)
 
         if verbose > 0:
             print("Size - train %d seqs , valid %d seqs "% \
@@ -454,7 +486,7 @@ def finetune_data_generate(
                  df_reads.loc[test_mask, :].shape[0]))
 
     else:
-        fp_data_seq = _with_compression_suffix(os.path.join(output_dir, "data.csv"))
-        _select_save_columns(df_reads).to_csv(fp_data_seq, sep="\t", header=True, index=None, compression=compression)
+        fp_data_seq = _output_path("data")
+        _write_sequences(_select_save_columns(df_reads), fp_data_seq)
 
     return df_reads

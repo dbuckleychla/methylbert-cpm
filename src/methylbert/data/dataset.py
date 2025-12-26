@@ -24,6 +24,10 @@ def _open_text(path: str):
 		return lzma.open(path, "rt")
 	return open(path, "r")
 
+def _is_parquet(path: str) -> bool:
+	path = path.lower()
+	return path.endswith(".parquet") or path.endswith(".pq")
+
 
 def _line2tokens_pretrain(l, tokenizer, max_len=120):
 	'''
@@ -243,24 +247,43 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		self.seq_len = seq_len
 		self.f_path = f_path
 
-		# Read all text files and convert the raw sequence into tokens
-		with _open_text(self.f_path) as f_input:
-			raw_seqs = f_input.read().splitlines()
+		if _is_parquet(self.f_path):
+			df_reads = pd.read_parquet(self.f_path)
+			self.headers = df_reads.columns.tolist()
+			required_headers = ["dna_seq", "methyl_seq", "ctype", "dmr_ctype", "dmr_label"]
+			if not all([h in self.headers for h in required_headers]):
+				raise ValueError("The header must contain dna_seq, methyl_seq, ctype, dmr_ctype, dmr_label")
 
-		# Check if there's a header
-		self.headers = raw_seqs[0].split("\t")
-		raw_seqs = raw_seqs[1:]
+			if n_seqs is not None:
+				df_reads = df_reads.head(n_seqs)
+			print("Total number of sequences : ", df_reads.shape[0])
 
-		if n_seqs is not None:
-			raw_seqs = raw_seqs[:n_seqs]
-		print("Total number of sequences : ", len(raw_seqs))
+			self.lines = []
+			for row in df_reads.to_dict("records"):
+				row["ctype_label"] = int(row["ctype"] == row["dmr_ctype"])
+				row["dmr_label"] = int(row["dmr_label"])
+				self.lines.append(row)
+			del df_reads
+			gc.collect()
+		else:
+			# Read all text files and convert the raw sequence into tokens
+			with _open_text(self.f_path) as f_input:
+				raw_seqs = f_input.read().splitlines()
 
-		# Multiprocessing for the sequence tokenisation
-		with mp.Pool(n_cores) as pool:
-			self.lines = pool.map(partial(_parse_line,
-								   headers=self.headers), raw_seqs)
-			del raw_seqs
-		gc.collect()
+			# Check if there's a header
+			self.headers = raw_seqs[0].split("\t")
+			raw_seqs = raw_seqs[1:]
+
+			if n_seqs is not None:
+				raw_seqs = raw_seqs[:n_seqs]
+			print("Total number of sequences : ", len(raw_seqs))
+
+			# Multiprocessing for the sequence tokenisation
+			with mp.Pool(n_cores) as pool:
+				self.lines = pool.map(partial(_parse_line,
+									   headers=self.headers), raw_seqs)
+				del raw_seqs
+			gc.collect()
 		self.set_dmr_labels = set([l["dmr_label"] for l in self.lines])
 
 		self.ctype_label_count = self._get_cls_num()
