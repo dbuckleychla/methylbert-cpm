@@ -166,7 +166,15 @@ def run_finetune(args):
 	if args.valid_batch < 0:
 		args.valid_batch = args.batch_size
 
-	test_data_loader = DataLoader(test_dataset, batch_size=args.valid_batch, num_workers=args.num_workers, pin_memory=args.with_cuda,  shuffle=False) if args.test_dataset is not None else None
+	test_sampler = None
+	if use_ddp and args.test_dataset is not None:
+		test_sampler = DistributedSampler(
+			test_dataset,
+			num_replicas=int(os.environ["WORLD_SIZE"]),
+			rank=int(os.environ["RANK"]),
+			shuffle=False,
+		)
+	test_data_loader = DataLoader(test_dataset, batch_size=args.valid_batch, num_workers=args.num_workers, pin_memory=args.with_cuda,  shuffle=False, sampler=test_sampler) if args.test_dataset is not None else None
 
 	# BERT train
 	print("Creating BERT Trainer")

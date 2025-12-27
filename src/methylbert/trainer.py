@@ -528,6 +528,11 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         logits = list()
 
         mean_loss = 0
+        use_ddp_metrics = _ddp_enabled() and not return_logits
+        local_correct = 0
+        local_total = 0
+        local_loss_sum = 0.0
+        local_batches = 0
         self.model.eval()
         with torch.no_grad():
             for i, batch in enumerate(data_loader):
@@ -543,13 +548,21 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
                 loss = mask_lm_output["loss"].mean().item() if "cuda" in self.device.type else mask_lm_output["loss"].item()
                 mean_loss += loss/len(data_loader)
+                if use_ddp_metrics:
+                    local_loss_sum += loss
+                    local_batches += 1
 
                 if self._config.with_cuda and torch.cuda.device_count() > 1:
                     torch.cuda.synchronize()
 
-                predict_res["dmr_label"].append(data["dmr_label"].detach().cpu())
-                predict_res["pred_ctype_label"].append(torch.argmax(mask_lm_output["classification_logits"], dim=-1).detach().cpu())
-                predict_res["ctype_label"].append(data["ctype_label"].detach().cpu())
+                if use_ddp_metrics:
+                    preds = torch.argmax(mask_lm_output["classification_logits"], dim=-1)
+                    local_correct += (preds == data["ctype_label"]).sum().item()
+                    local_total += data["ctype_label"].numel()
+                else:
+                    predict_res["dmr_label"].append(data["dmr_label"].detach().cpu())
+                    predict_res["pred_ctype_label"].append(torch.argmax(mask_lm_output["classification_logits"], dim=-1).detach().cpu())
+                    predict_res["ctype_label"].append(data["ctype_label"].detach().cpu())
 
                 if return_logits:
                     logits.append(mask_lm_output["classification_logits"].detach().cpu().numpy())
@@ -557,13 +570,27 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                 del mask_lm_output
                 del data
 
-        predict_res["dmr_label"] = np.concatenate(predict_res["dmr_label"],  axis=0)
-        predict_res["ctype_label"] = np.concatenate(predict_res["ctype_label"],  axis=0)
-        predict_res["pred_ctype_label"] = np.concatenate(predict_res["pred_ctype_label"], axis=0)
+        if not use_ddp_metrics:
+            predict_res["dmr_label"] = np.concatenate(predict_res["dmr_label"],  axis=0)
+            predict_res["ctype_label"] = np.concatenate(predict_res["ctype_label"],  axis=0)
+            predict_res["pred_ctype_label"] = np.concatenate(predict_res["pred_ctype_label"], axis=0)
 
         self.model.train()
 
         if not return_logits:
+            if use_ddp_metrics:
+                loss_tensor = torch.tensor(local_loss_sum, device=self.device, dtype=torch.float32)
+                batch_tensor = torch.tensor(local_batches, device=self.device, dtype=torch.float32)
+                correct_tensor = torch.tensor(local_correct, device=self.device, dtype=torch.float32)
+                total_tensor = torch.tensor(local_total, device=self.device, dtype=torch.float32)
+                dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(batch_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+                dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
+
+                eval_loss = (loss_tensor / batch_tensor).item() if batch_tensor.item() > 0 else 0.0
+                eval_acc = (correct_tensor / total_tensor).item() if total_tensor.item() > 0 else 0.0
+                return None, eval_loss, eval_acc
             return predict_res, mean_loss
         else:
             return predict_res, mean_loss, np.concatenate(return_logits, axis=0)
@@ -695,15 +722,17 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                         dist.barrier()
 
                     eval_loss = None
-                    if self.is_rank0 and self.test_data is not None:
-                        # Evaluation
+                    eval_acc = None
+                    if _ddp_enabled():
+                        _, eval_loss, eval_acc = self._eval_iteration(self.test_data)
+                    else:
                         eval_pred, eval_loss = self._eval_iteration(self.test_data)
                         eval_acc = self._acc(eval_pred["pred_ctype_label"], eval_pred["ctype_label"])
+                        del eval_pred
 
+                    if self.is_rank0:
                         with open(self.f_eval, "a") as f_perform:
                             f_perform.write("\t".join([str(self.step), str(eval_loss), str(eval_acc)]) +"\n")
-
-                        del eval_pred
 
                         if self.step % self._config.log_freq == 0:
                             if verbose > 0:
