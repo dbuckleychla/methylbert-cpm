@@ -158,7 +158,7 @@ def run_finetune(args):
 		train_dataset,
 		batch_size=local_step_batch_size,
 		num_workers=args.num_workers,
-		pin_memory=False,
+		pin_memory=args.with_cuda,
 		shuffle=train_sampler is None,
 		sampler=train_sampler,
 	)
@@ -166,7 +166,7 @@ def run_finetune(args):
 	if args.valid_batch < 0:
 		args.valid_batch = args.batch_size
 
-	test_data_loader = DataLoader(test_dataset, batch_size=args.valid_batch, num_workers=args.num_workers, pin_memory=True,  shuffle=False) if args.test_dataset is not None else None
+	test_data_loader = DataLoader(test_dataset, batch_size=args.valid_batch, num_workers=args.num_workers, pin_memory=args.with_cuda,  shuffle=False) if args.test_dataset is not None else None
 
 	# BERT train
 	print("Creating BERT Trainer")

@@ -683,7 +683,12 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     self.scheduler.step()
                     self.model.zero_grad()
 
-                do_eval = ((local_step+1) % self._config.eval_freq == 0 or local_step == 0)
+                do_eval = (
+                    self._config.eval_freq is not None
+                    and self._config.eval_freq > 0
+                    and ((local_step+1) % self._config.eval_freq == 0 or local_step == 0)
+                    and self.test_data is not None
+                )
                 if do_eval:
                     should_save_freq = (type(self._config.save_freq) == int) and (self.step % self._config.save_freq == 0)
                     if _ddp_enabled() and should_save_freq:
