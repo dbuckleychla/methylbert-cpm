@@ -142,12 +142,13 @@ class MethylBertTrainer(object):
         if _ddp_enabled():
             if self.is_rank0:
                 print(f"Using DDP: world_size={self.world_size}, local_rank={self.local_rank}")
+            find_unused = getattr(self, "_ddp_find_unused_parameters", False)
             self.model = DDP(
                 self.model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
                 broadcast_buffers=False,
-                find_unused_parameters=False,
+                find_unused_parameters=find_unused,
             )
         else:
             if self._config.with_cuda and torch.cuda.device_count() > 1:
@@ -486,6 +487,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
 
 class MethylBertFinetuneTrainer(MethylBertTrainer):
     def __init__(self, *args, **kwargs):
+        self._ddp_find_unused_parameters = True
         super().__init__(*args, **kwargs)
 
     def summary(self):
