@@ -345,3 +345,6 @@ def main(args=None):
 		run_finetune(args)
 	elif selected_option == "deconvolute":
 		run_deconvolute(args)
+
+if __name__ == "__main__":
+	main()
