@@ -608,7 +608,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         epochs = steps // (len(data_loader) // self._config.gradient_accumulation_steps) + 1
 
         self.model.zero_grad()
-        if verbose > 0:
+        if self.is_rank0 and verbose > 0:
             print(self.model.training)
         self.model.train()
         train_prediction_res = {"dmr_label":[], "pred_ctype_label":[], "ctype_label":[]}
@@ -616,13 +616,23 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         scaler = GradScaler() if self._config.amp else None
 
         duration = 0
-        epoch_progress_bar = tqdm(total=epochs, desc="Training...")
+        epoch_progress_bar = tqdm(total=epochs, desc="Training...", disable=not self.is_rank0)
         for epoch in range(epochs):
+            if isinstance(data_loader.sampler, torch.utils.data.distributed.DistributedSampler):
+                data_loader.sampler.set_epoch(epoch)
+            if self.is_rank0 and verbose > 0:
+                print(f"Epoch {epoch+1}/{epochs}")
+
             steps_progress_bar = tqdm(total=min(steps, len(data_loader)),
-                                      desc=f"Epoch {epoch+1}/{epochs}")
+                                      desc=f"Epoch {epoch+1}/{epochs}",
+                                      disable=not self.is_rank0)
             for i, batch in enumerate(data_loader):
                 # 0. batch_data will be sent into the device(GPU or cpu)
-                data = {key: value.to(self.device) for key, value in batch.items() if type(value) != list}
+                data = {
+                    key: (value.to(self.device, non_blocking=True) if isinstance(value, torch.Tensor) else value)
+                    for key, value in batch.items()
+                    if type(value) != list
+                }
 
                 start = time.time()
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
@@ -647,6 +657,10 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                 loss = mask_lm_output["loss"].mean() if "cuda" in self.device.type else mask_lm_output["loss"]
                 loss = loss/self._config.gradient_accumulation_steps
                 scaler.scale(loss).backward(retain_graph=True) if self._config.amp else loss.backward(retain_graph=True)
+                if _ddp_enabled() and self.step % 100 == 0:
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
                 loss_val = loss.item()
                 global_step_loss += loss_val
@@ -667,35 +681,44 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     self.scheduler.step()
                     self.model.zero_grad()
 
-                if (local_step+1) % self._config.eval_freq == 0 or local_step == 0:
-                    # Evaluation
-                    eval_pred, eval_loss = self._eval_iteration(self.test_data)
-                    eval_acc = self._acc(eval_pred["pred_ctype_label"], eval_pred["ctype_label"])
+                do_eval = ((local_step+1) % self._config.eval_freq == 0 or local_step == 0)
+                if do_eval:
+                    should_save_freq = (type(self._config.save_freq) == int) and (self.step % self._config.save_freq == 0)
+                    if _ddp_enabled() and should_save_freq:
+                        dist.barrier()
 
-                    with open(self.f_eval, "a") as f_perform:
-                        f_perform.write("\t".join([str(self.step), str(eval_loss), str(eval_acc)]) +"\n")
+                    eval_loss = None
+                    if self.is_rank0 and self.test_data is not None:
+                        # Evaluation
+                        eval_pred, eval_loss = self._eval_iteration(self.test_data)
+                        eval_acc = self._acc(eval_pred["pred_ctype_label"], eval_pred["ctype_label"])
 
-                    del eval_pred
+                        with open(self.f_eval, "a") as f_perform:
+                            f_perform.write("\t".join([str(self.step), str(eval_loss), str(eval_acc)]) +"\n")
 
-                    if self.is_rank0 and self.step % self._config.log_freq == 0:
-                        if verbose > 0:
-                            print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
-                            print(f"Running time for iter = {duration}")
+                        del eval_pred
 
-                    if self.min_loss > eval_loss:
-                        if verbose > 0:
-                            print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, eval_loss, self.min_loss, self.save_path))
-                        self.save(self.save_path)
-                        self.min_loss = eval_loss
+                        if self.step % self._config.log_freq == 0:
+                            if verbose > 0:
+                                print("\nTrain Step %d iter - loss : %f / lr : %f"%(self.step, global_step_loss, self.optim.param_groups[0]["lr"]))
+                                print(f"Running time for iter = {duration}")
 
-                    # For saving an interim model to track the training
-                    if ( type(self._config.save_freq) == int ) and (self.step % self._config.save_freq == 0):
-                        step_save_dir=self.save_path.replace("bert.model", "bert.model_step%d"%(self.step))
-                        if verbose > 0:
-                            print("Step %d: Save an interim model at %s"%(self.step, step_save_dir))
-                        if not os.path.exists(step_save_dir):
-                            os.mkdir(step_save_dir)
-                        self.save(step_save_dir)
+                        if self.min_loss > eval_loss:
+                            if verbose > 0:
+                                print("Step %d loss (%f) is lower than the current min loss (%f). Save the model at %s"%(self.step, eval_loss, self.min_loss, self.save_path))
+                            self.save(self.save_path)
+                            self.min_loss = eval_loss
+
+                        # For saving an interim model to track the training
+                        if should_save_freq:
+                            step_save_dir=self.save_path.replace("bert.model", "bert.model_step%d"%(self.step))
+                            if verbose > 0:
+                                print("Step %d: Save an interim model at %s"%(self.step, step_save_dir))
+                            if not os.path.exists(step_save_dir):
+                                os.mkdir(step_save_dir)
+                            self.save(step_save_dir)
+                    if _ddp_enabled() and should_save_freq:
+                        dist.barrier()
 
                     # Save the step info (step, loss, lr, acc)
                     if self.is_rank0:
@@ -708,7 +731,8 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
                             f_perform.write("\t".join([str(self.step), str(global_step_loss), str(train_ctype_acc),  str(self.optim.param_groups[0]["lr"])])+"\n")
 
-                    steps_progress_bar.set_postfix(eval_loss=eval_loss)
+                    if self.is_rank0 and eval_loss is not None:
+                        steps_progress_bar.set_postfix(eval_loss=eval_loss)
                     # Reset prediction result
                     del train_prediction_res
                     train_prediction_res =  {"dmr_label":[], "pred_ctype_label":[], "ctype_label":[]}

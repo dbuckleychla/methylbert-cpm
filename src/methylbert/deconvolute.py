@@ -192,6 +192,8 @@ def deconvolute(trainer : MethylBertFinetuneTrainer,
 												tokenizer=tokenizer,
 												logit=True)
 	total_res = total_res.drop(columns=["ctype_label"])
+	if "read_name" not in total_res.columns and "name" in total_res.columns:
+		total_res["read_name"] = total_res["name"]
 
 	# Save the classification results 
 	total_res["n_cpg"]=total_res["methyl_seq"].apply(lambda x: x.count("0") + x.count("1"))

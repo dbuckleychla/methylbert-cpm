@@ -435,9 +435,14 @@ def finetune_data_generate(
         print("Total sequences per cell type")
         print(df_reads["ctype"].value_counts())
 
+    if output_format == "parquet" and "name" in df_reads.columns and "read_name" not in df_reads.columns:
+        df_reads["read_name"] = df_reads["name"]
+
     columns_to_save = None
     if save_mode == "minimal":
         columns_to_save = ["dna_seq", "methyl_seq", "ctype", "dmr_ctype", "dmr_label"]
+        if output_format == "parquet" and "read_name" in df_reads.columns:
+            columns_to_save.append("read_name")
         missing_columns = [c for c in columns_to_save if c not in df_reads.columns]
         if missing_columns:
             raise ValueError(f"Missing required columns for minimal output: {missing_columns}")

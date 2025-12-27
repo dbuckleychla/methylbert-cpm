@@ -14,12 +14,16 @@ from methylbert import __version__
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 OPTIONS = [
 	"preprocess_finetune", 
 	"finetune", 
 	"deconvolute"
 ]
+
+def _is_torchrun():
+	return "RANK" in os.environ and "WORLD_SIZE" in os.environ and "LOCAL_RANK" in os.environ
 
 def deconvolute_arg_parser(subparsers):
 	parser = subparsers.add_parser('deconvolute', help='Run MethylBERT tumour deconvolution')
@@ -139,8 +143,25 @@ def run_finetune(args):
 	print("Creating Dataloader")
 	local_step_batch_size = int(args.batch_size/args.gradient_accumulation_steps)
 	print("Local step batch size : ", local_step_batch_size)
-	
-	train_data_loader = DataLoader(train_dataset, batch_size=local_step_batch_size, num_workers= args.num_workers, pin_memory=False,  shuffle=True)
+
+	use_ddp = args.with_cuda and _is_torchrun()
+	train_sampler = None
+	if use_ddp:
+		train_sampler = DistributedSampler(
+			train_dataset,
+			num_replicas=int(os.environ["WORLD_SIZE"]),
+			rank=int(os.environ["RANK"]),
+			shuffle=True,
+		)
+
+	train_data_loader = DataLoader(
+		train_dataset,
+		batch_size=local_step_batch_size,
+		num_workers=args.num_workers,
+		pin_memory=False,
+		shuffle=train_sampler is None,
+		sampler=train_sampler,
+	)
 
 	if args.valid_batch < 0:
 		args.valid_batch = args.batch_size
