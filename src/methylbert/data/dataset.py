@@ -1,8 +1,11 @@
 import bz2
 import gc
 import gzip
+import hashlib
+import json
 import lzma
 import multiprocessing as mp
+import os
 import random
 from copy import deepcopy
 from functools import partial
@@ -28,6 +31,11 @@ def _is_parquet(path: str) -> bool:
 	path = path.lower()
 	return path.endswith(".parquet") or path.endswith(".pq")
 
+def _token_cache_prefix(f_path: str, seq_len: int, cache_dir: str) -> str:
+	abs_path = os.path.abspath(f_path)
+	hash_id = hashlib.md5(abs_path.encode("utf-8")).hexdigest()[:10]
+	base = f"{os.path.basename(f_path)}.{hash_id}.seq{seq_len}"
+	return os.path.join(cache_dir, base)
 
 def _line2tokens_pretrain(l, tokenizer, max_len=120):
 	'''
@@ -227,7 +235,8 @@ class MethylBertPretrainDataset(MethylBertDataset):
 		return inputs, labels, masked_index
 
 class MethylBertFinetuneDataset(MethylBertDataset):
-	def __init__(self, f_path: str, vocab: MethylVocab, seq_len: int, n_cores: int=10, n_seqs = None):
+	def __init__(self, f_path: str, vocab: MethylVocab, seq_len: int, n_cores: int=10, n_seqs = None,
+				 token_cache_dir: str = None, rebuild_token_cache: bool = False):
 		'''
 		MethylBERT dataset
 
@@ -241,11 +250,38 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			Number of cores for multiprocessing
 		n_seqs: int
 			Number of sequences to subset the input (default: None, do not make a subset)
+		token_cache_dir: str
+			Directory to store/load pre-tokenized arrays (default: None)
+		rebuild_token_cache: bool
+			Rebuild token cache even if present (default: False)
 
 		'''
 		self.vocab = vocab
 		self.seq_len = seq_len
 		self.f_path = f_path
+		self._use_token_cache = False
+		self._length = None
+		self._cache_paths = None
+
+		if token_cache_dir is not None:
+			os.makedirs(token_cache_dir, exist_ok=True)
+			prefix = _token_cache_prefix(self.f_path, self.seq_len, token_cache_dir)
+			self._cache_paths = {
+				"dna": f"{prefix}.dna.npy",
+				"methyl": f"{prefix}.methyl.npy",
+				"dmr_label": f"{prefix}.dmr_label.npy",
+				"ctype_label": f"{prefix}.ctype_label.npy",
+				"meta": f"{prefix}.meta.json",
+			}
+			cache_ready = all(os.path.exists(p) for p in self._cache_paths.values())
+			if cache_ready and not rebuild_token_cache:
+				self._load_token_cache()
+			else:
+				self._build_token_cache(n_seqs=n_seqs)
+				self._load_token_cache()
+
+		if self._use_token_cache:
+			return
 
 		if _is_parquet(self.f_path):
 			df_reads = pd.read_parquet(self.f_path)
@@ -289,9 +325,104 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		self.ctype_label_count = self._get_cls_num()
 		print("# of reads in each label: ", self.ctype_label_count)
 
+	def _build_token_cache(self, n_seqs=None):
+		if _is_parquet(self.f_path):
+			df_reads = pd.read_parquet(self.f_path)
+			self.headers = df_reads.columns.tolist()
+			required_headers = ["dna_seq", "methyl_seq", "ctype", "dmr_ctype", "dmr_label"]
+			if not all([h in self.headers for h in required_headers]):
+				raise ValueError("The header must contain dna_seq, methyl_seq, ctype, dmr_ctype, dmr_label")
+			if n_seqs is not None:
+				df_reads = df_reads.head(n_seqs)
+			records = df_reads.to_dict("records")
+			del df_reads
+		else:
+			with _open_text(self.f_path) as f_input:
+				raw_seqs = f_input.read().splitlines()
+			self.headers = raw_seqs[0].split("\t")
+			raw_seqs = raw_seqs[1:]
+			if n_seqs is not None:
+				raw_seqs = raw_seqs[:n_seqs]
+			records = raw_seqs
+
+		n_rows = len(records)
+		print("Pre-tokenizing sequences : ", n_rows)
+
+		dna_mm = np.lib.format.open_memmap(self._cache_paths["dna"], mode="w+", dtype=np.int32, shape=(n_rows, self.seq_len + 1))
+		methyl_mm = np.lib.format.open_memmap(self._cache_paths["methyl"], mode="w+", dtype=np.int8, shape=(n_rows, self.seq_len + 1))
+		dmr_label_mm = np.lib.format.open_memmap(self._cache_paths["dmr_label"], mode="w+", dtype=np.int32, shape=(n_rows,))
+		ctype_label_mm = np.lib.format.open_memmap(self._cache_paths["ctype_label"], mode="w+", dtype=np.int8, shape=(n_rows,))
+
+		for idx, rec in enumerate(records):
+			if isinstance(rec, str):
+				parsed = _parse_line(rec, self.headers)
+			else:
+				parsed = rec
+				parsed["ctype_label"] = int(parsed["ctype"] == parsed["dmr_ctype"])
+				parsed["dmr_label"] = int(parsed["dmr_label"])
+
+			item = _line2tokens_finetune(
+				l=parsed,
+				tokenizer=self.vocab, max_len=self.seq_len, headers=self.headers)
+
+			dna_seq = np.array(item["dna_seq"], dtype=np.int32).squeeze()
+			methyl_seq = np.array(item["methyl_seq"], dtype=np.int8).squeeze()
+
+			non_pad = np.where(dna_seq != self.vocab.pad_index)[0]
+			if non_pad.size > 0:
+				end = non_pad[-1] + 1
+				if end < dna_seq.shape[0]:
+					dna_seq[end] = self.vocab.eos_index
+					methyl_seq[end] = 2
+				else:
+					dna_seq[-1] = self.vocab.eos_index
+					methyl_seq[-1] = 2
+
+			dna_seq = np.concatenate([[self.vocab.sos_index], dna_seq])
+			methyl_seq = np.concatenate([[2], methyl_seq])
+
+			dna_mm[idx] = dna_seq
+			methyl_mm[idx] = methyl_seq
+			dmr_label_mm[idx] = parsed["dmr_label"]
+			ctype_label_mm[idx] = parsed["ctype_label"]
+
+		meta = {
+			"seq_len": self.seq_len,
+			"source": os.path.abspath(self.f_path),
+			"rows": n_rows,
+			"version": 1,
+		}
+		with open(self._cache_paths["meta"], "w") as fp:
+			json.dump(meta, fp)
+
+		del dna_mm, methyl_mm, dmr_label_mm, ctype_label_mm
+		gc.collect()
+
+	def _load_token_cache(self):
+		with open(self._cache_paths["meta"], "r") as fp:
+			meta = json.load(fp)
+		if int(meta.get("seq_len", -1)) != self.seq_len:
+			raise ValueError("Token cache seq_len does not match dataset seq_len.")
+
+		self._dna_cache = np.load(self._cache_paths["dna"], mmap_mode="r")
+		self._methyl_cache = np.load(self._cache_paths["methyl"], mmap_mode="r")
+		self._dmr_label_cache = np.load(self._cache_paths["dmr_label"], mmap_mode="r")
+		self._ctype_label_cache = np.load(self._cache_paths["ctype_label"], mmap_mode="r")
+
+		self._length = self._dna_cache.shape[0]
+		self._use_token_cache = True
+		self.headers = ["dna_seq", "methyl_seq", "ctype", "dmr_ctype", "dmr_label"]
+
+		self.set_dmr_labels = set(np.unique(self._dmr_label_cache))
+		self.ctype_label_count = self._get_cls_num()
+		print("# of reads in each label: ", self.ctype_label_count)
+
 	def _get_cls_num(self):
 		# unique labels
-		ctype_labels=[l["ctype_label"] for l in self.lines]
+		if self._use_token_cache:
+			ctype_labels = self._ctype_label_cache[:self._length]
+		else:
+			ctype_labels=[l["ctype_label"] for l in self.lines]
 		labels = list(set(ctype_labels))
 		label_count = np.zeros(len(labels))
 		for l in labels:
@@ -302,9 +433,20 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		return max(len(self.set_dmr_labels), max(self.set_dmr_labels)+1) # +1 is for the label 0
 
 	def subset_data(self, n_seq):
-		self.lines = self.lines[:n_seq]
+		if self._use_token_cache:
+			self._length = min(n_seq, self._length)
+		else:
+			self.lines = self.lines[:n_seq]
 
 	def __getitem__(self, index):
+		if self._use_token_cache:
+			return {
+				"dna_seq": torch.tensor(self._dna_cache[index], dtype=torch.int32),
+				"methyl_seq": torch.tensor(self._methyl_cache[index], dtype=torch.int8),
+				"dmr_label": torch.tensor(self._dmr_label_cache[index], dtype=torch.int64),
+				"ctype_label": torch.tensor(self._ctype_label_cache[index], dtype=torch.int64),
+			}
+
 		line = deepcopy(self.lines[index])
 
 		item = _line2tokens_finetune(
@@ -326,3 +468,8 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		item["methyl_seq"] = torch.cat((torch.tensor([2]), item["methyl_seq"]))
 
 		return item
+
+	def __len__(self):
+		if self._use_token_cache:
+			return self._length
+		return super().__len__()

@@ -80,6 +80,8 @@ def finetune_arg_parser(subparsers):
 	parser.add_argument("--adam_beta2", type=float, default=0.98, help="adamW second beta value (default: 0.98)")
 	parser.add_argument("--warm_up", type=int, default=100, help="steps for warm-up (default: 100)")
 	parser.add_argument("--decrease_steps", type=int, default=200, help="step to decrease the learning rate (default: 200)")
+	parser.add_argument("--token_cache_dir", type=str, default=None, help="Directory for pre-tokenized finetune arrays (default: None)")
+	parser.add_argument("--rebuild_token_cache", default=False, action="store_true", help="Rebuild token cache even if present (default: False)")
 
 	# Others
 	parser.add_argument("--seed", type=int, default=950410, help="seed number (default: 950410)")
@@ -130,14 +132,18 @@ def run_finetune(args):
 	# Load data sets
 	print("Loading Train Dataset:", args.train_dataset)
 	train_dataset = MethylBertFinetuneDataset(args.train_dataset, tokenizer, 
-											  seq_len=args.seq_len)
+											  seq_len=args.seq_len,
+											  token_cache_dir=args.token_cache_dir,
+											  rebuild_token_cache=args.rebuild_token_cache)
 
 	print("%d seqs with %d labels "%(len(train_dataset), train_dataset.num_dmrs()))
 	print("Loading Test Dataset:", args.test_dataset)
 
 	if args.test_dataset is not None:
 		test_dataset = MethylBertFinetuneDataset(args.test_dataset, tokenizer, 
-								   				 seq_len=args.seq_len) 
+								   				 seq_len=args.seq_len,
+												 token_cache_dir=args.token_cache_dir,
+												 rebuild_token_cache=args.rebuild_token_cache) 
 
 	# Create a data loader
 	print("Creating Dataloader")

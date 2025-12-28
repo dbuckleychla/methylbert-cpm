@@ -349,6 +349,7 @@ class MethylBertPretrainTrainer(MethylBertTrainer):
         scaler = GradScaler() if self._config.amp else None
 
         duration = 0
+        pad_idx = self.train_data.dataset.vocab.pad_index if self.train_data is not None else 0
         for epoch in range(epochs):
 
             # DDP: make DistributedSampler shuffle differently each epoch
@@ -528,6 +529,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
         logits = list()
 
         mean_loss = 0
+        pad_idx = self.train_data.dataset.vocab.pad_index if self.train_data is not None else 0
         use_ddp_metrics = _ddp_enabled() and not return_logits
         local_correct = 0
         local_total = 0
@@ -540,8 +542,10 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                 data = {key: value.to(self.device) for key, value in batch.items() if type(value) != list}
 
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu", enabled=self._config.amp):
+                    attention_mask = (data["dna_seq"] != pad_idx).long()
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids = data["dna_seq"],
+                                            attention_mask=attention_mask,
                                             token_type_ids=data["methyl_seq"],
                                             labels = data["dmr_label"],
                                             ctype_label=data["ctype_label"])
@@ -666,8 +670,10 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                 start = time.time()
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
+                    attention_mask = (data["dna_seq"] != pad_idx).long()
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids=data["dna_seq"],
+                                            attention_mask=attention_mask,
                                             token_type_ids=data["methyl_seq"],
                                             labels=data["dmr_label"],
                                             ctype_label=data["ctype_label"])
@@ -717,6 +723,8 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     and self.test_data is not None
                 )
                 if do_eval:
+                    if _ddp_enabled():
+                        dist.barrier()
                     should_save_freq = (type(self._config.save_freq) == int) and (self.step % self._config.save_freq == 0)
                     if _ddp_enabled() and should_save_freq:
                         dist.barrier()
@@ -754,6 +762,8 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                                 os.mkdir(step_save_dir)
                             self.save(step_save_dir)
                     if _ddp_enabled() and should_save_freq:
+                        dist.barrier()
+                    if _ddp_enabled():
                         dist.barrier()
 
                     # Save the step info (step, loss, lr, acc)
@@ -893,8 +903,10 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
             with torch.no_grad():
                 with torch.autocast(device_type="cuda" if self._config.with_cuda else "cpu",
                                     enabled=self._config.amp):
+                    attention_mask = (data["dna_seq"] != tokenizer.pad_index).long()
                     mask_lm_output = self.model.forward(step=0,
                                             input_ids = data["dna_seq"],
+                                            attention_mask=attention_mask,
                                             token_type_ids=data["methyl_seq"],
                                             labels = data["dmr_label"],
                                             ctype_label=data["ctype_label"])
