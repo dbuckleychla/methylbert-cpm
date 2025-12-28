@@ -40,17 +40,6 @@ def _token_cache_prefix(f_path: str, seq_len: int, kmer: int, cache_dir: str, n_
 		base = f"{base}.n{n_seqs}"
 	return os.path.join(cache_dir, base)
 
-def _ddp_rank_info():
-	try:
-		rank = int(os.environ.get("RANK", "0"))
-	except ValueError:
-		rank = 0
-	try:
-		world_size = int(os.environ.get("WORLD_SIZE", "1"))
-	except ValueError:
-		world_size = 1
-	return rank, world_size
-
 def _line2tokens_pretrain(l, tokenizer, max_len=120):
 	'''
 		convert a text line into a list of tokens converted by tokenizer
@@ -296,20 +285,11 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			}
 			cache_files = ("dna", "methyl", "dmr_label", "ctype_label", "meta")
 			cache_ready = all(os.path.exists(self._cache_paths[k]) for k in cache_files)
-			rank, world_size = _ddp_rank_info()
-			is_rank0 = (rank == 0)
-
 			if cache_ready and not rebuild_token_cache:
 				self._load_token_cache()
 			else:
-				if is_rank0:
-					if rebuild_token_cache and cache_ready:
-						try:
-							os.remove(self._cache_paths["meta"])
-						except FileNotFoundError:
-							pass
-					self._build_token_cache(n_seqs=n_seqs)
-				else:
+				built = self._build_token_cache(n_seqs=n_seqs)
+				if not built:
 					self._wait_for_token_cache(wait_for_refresh=rebuild_token_cache)
 				self._load_token_cache()
 
@@ -360,9 +340,17 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 
 	def _build_token_cache(self, n_seqs=None):
 		lock_path = self._cache_paths.get("lock") if self._cache_paths else None
+		lock_acquired = False
 		if lock_path is not None:
-			with open(lock_path, "w") as fp:
-				fp.write(f"{os.getpid()}\n")
+			try:
+				fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+				with os.fdopen(fd, "w") as fp:
+					fp.write(f"{os.getpid()}\n")
+				lock_acquired = True
+			except FileExistsError:
+				return False
+		else:
+			lock_acquired = True
 		try:
 			if _is_parquet(self.f_path):
 				df_reads = pd.read_parquet(self.f_path)
@@ -437,8 +425,9 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			del dna_mm, methyl_mm, dmr_label_mm, ctype_label_mm
 			gc.collect()
 		finally:
-			if lock_path is not None and os.path.exists(lock_path):
+			if lock_path is not None and lock_acquired and os.path.exists(lock_path):
 				os.remove(lock_path)
+		return True
 
 	def _wait_for_token_cache(self, timeout_s: int = 3600, poll_s: int = 5, wait_for_refresh: bool = False):
 		if not self._cache_paths:
