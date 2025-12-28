@@ -546,7 +546,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids = data["dna_seq"],
                                             attention_mask=attention_mask,
-                                            token_type_ids=data["methyl_seq"],
+                                            token_type_ids=data["methyl_seq"].long(),
                                             labels = data["dmr_label"],
                                             ctype_label=data["ctype_label"])
 
@@ -675,7 +675,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     mask_lm_output = self.model.forward(step=self.step,
                                             input_ids=data["dna_seq"],
                                             attention_mask=attention_mask,
-                                            token_type_ids=data["methyl_seq"],
+                                            token_type_ids=data["methyl_seq"].long(),
                                             labels=data["dmr_label"],
                                             ctype_label=data["ctype_label"])
                 loss = mask_lm_output["loss"]
@@ -912,7 +912,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     mask_lm_output = self.model.forward(step=0,
                                             input_ids = data["dna_seq"],
                                             attention_mask=attention_mask,
-                                            token_type_ids=data["methyl_seq"],
+                                            token_type_ids=data["methyl_seq"].long(),
                                             labels = data["dmr_label"],
                                             ctype_label=data["ctype_label"])
 
