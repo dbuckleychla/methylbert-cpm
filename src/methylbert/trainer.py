@@ -692,7 +692,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                 # Calculate loss and back-propagation
                 loss = mask_lm_output["loss"].mean() if "cuda" in self.device.type else mask_lm_output["loss"]
                 loss = loss/self._config.gradient_accumulation_steps
-                scaler.scale(loss).backward(retain_graph=True) if self._config.amp else loss.backward(retain_graph=True)
+                scaler.scale(loss).backward() if self._config.amp else loss.backward()
                 if _ddp_enabled() and self.step % 100 == 0:
                     for p in self.model.parameters():
                         if p.grad is not None:
@@ -724,11 +724,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     and self.test_data is not None
                 )
                 if do_eval:
-                    if _ddp_enabled():
-                        dist.barrier()
                     should_save_freq = (type(self._config.save_freq) == int) and (self.step % self._config.save_freq == 0)
-                    if _ddp_enabled() and should_save_freq:
-                        dist.barrier()
 
                     eval_loss = None
                     eval_acc = None
@@ -762,10 +758,6 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                             if not os.path.exists(step_save_dir):
                                 os.mkdir(step_save_dir)
                             self.save(step_save_dir)
-                    if _ddp_enabled() and should_save_freq:
-                        dist.barrier()
-                    if _ddp_enabled():
-                        dist.barrier()
 
                     # Save the step info (step, loss, lr, acc)
                     if self.is_rank0:
