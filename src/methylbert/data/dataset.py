@@ -7,6 +7,7 @@ import lzma
 import multiprocessing as mp
 import os
 import random
+import time
 from copy import deepcopy
 from functools import partial
 
@@ -31,11 +32,24 @@ def _is_parquet(path: str) -> bool:
 	path = path.lower()
 	return path.endswith(".parquet") or path.endswith(".pq")
 
-def _token_cache_prefix(f_path: str, seq_len: int, cache_dir: str) -> str:
+def _token_cache_prefix(f_path: str, seq_len: int, kmer: int, cache_dir: str, n_seqs: int = None) -> str:
 	abs_path = os.path.abspath(f_path)
 	hash_id = hashlib.md5(abs_path.encode("utf-8")).hexdigest()[:10]
-	base = f"{os.path.basename(f_path)}.{hash_id}.seq{seq_len}"
+	base = f"{os.path.basename(f_path)}.{hash_id}.seq{seq_len}.k{kmer}"
+	if n_seqs is not None:
+		base = f"{base}.n{n_seqs}"
 	return os.path.join(cache_dir, base)
+
+def _ddp_rank_info():
+	try:
+		rank = int(os.environ.get("RANK", "0"))
+	except ValueError:
+		rank = 0
+	try:
+		world_size = int(os.environ.get("WORLD_SIZE", "1"))
+	except ValueError:
+		world_size = 1
+	return rank, world_size
 
 def _line2tokens_pretrain(l, tokenizer, max_len=120):
 	'''
@@ -265,19 +279,38 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 
 		if token_cache_dir is not None:
 			os.makedirs(token_cache_dir, exist_ok=True)
-			prefix = _token_cache_prefix(self.f_path, self.seq_len, token_cache_dir)
+			prefix = _token_cache_prefix(
+				self.f_path,
+				self.seq_len,
+				self.vocab.kmers,
+				token_cache_dir,
+				n_seqs=n_seqs,
+			)
 			self._cache_paths = {
 				"dna": f"{prefix}.dna.npy",
 				"methyl": f"{prefix}.methyl.npy",
 				"dmr_label": f"{prefix}.dmr_label.npy",
 				"ctype_label": f"{prefix}.ctype_label.npy",
 				"meta": f"{prefix}.meta.json",
+				"lock": f"{prefix}.lock",
 			}
-			cache_ready = all(os.path.exists(p) for p in self._cache_paths.values())
+			cache_files = ("dna", "methyl", "dmr_label", "ctype_label", "meta")
+			cache_ready = all(os.path.exists(self._cache_paths[k]) for k in cache_files)
+			rank, world_size = _ddp_rank_info()
+			is_rank0 = (rank == 0)
+
 			if cache_ready and not rebuild_token_cache:
 				self._load_token_cache()
 			else:
-				self._build_token_cache(n_seqs=n_seqs)
+				if is_rank0:
+					if rebuild_token_cache and cache_ready:
+						try:
+							os.remove(self._cache_paths["meta"])
+						except FileNotFoundError:
+							pass
+					self._build_token_cache(n_seqs=n_seqs)
+				else:
+					self._wait_for_token_cache(wait_for_refresh=rebuild_token_cache)
 				self._load_token_cache()
 
 		if self._use_token_cache:
@@ -326,83 +359,124 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		print("# of reads in each label: ", self.ctype_label_count)
 
 	def _build_token_cache(self, n_seqs=None):
-		if _is_parquet(self.f_path):
-			df_reads = pd.read_parquet(self.f_path)
-			self.headers = df_reads.columns.tolist()
-			required_headers = ["dna_seq", "methyl_seq", "ctype", "dmr_ctype", "dmr_label"]
-			if not all([h in self.headers for h in required_headers]):
-				raise ValueError("The header must contain dna_seq, methyl_seq, ctype, dmr_ctype, dmr_label")
-			if n_seqs is not None:
-				df_reads = df_reads.head(n_seqs)
-			records = df_reads.to_dict("records")
-			del df_reads
-		else:
-			with _open_text(self.f_path) as f_input:
-				raw_seqs = f_input.read().splitlines()
-			self.headers = raw_seqs[0].split("\t")
-			raw_seqs = raw_seqs[1:]
-			if n_seqs is not None:
-				raw_seqs = raw_seqs[:n_seqs]
-			records = raw_seqs
-
-		n_rows = len(records)
-		print("Pre-tokenizing sequences : ", n_rows)
-
-		dna_mm = np.lib.format.open_memmap(self._cache_paths["dna"], mode="w+", dtype=np.int32, shape=(n_rows, self.seq_len + 1))
-		methyl_mm = np.lib.format.open_memmap(self._cache_paths["methyl"], mode="w+", dtype=np.int8, shape=(n_rows, self.seq_len + 1))
-		dmr_label_mm = np.lib.format.open_memmap(self._cache_paths["dmr_label"], mode="w+", dtype=np.int32, shape=(n_rows,))
-		ctype_label_mm = np.lib.format.open_memmap(self._cache_paths["ctype_label"], mode="w+", dtype=np.int8, shape=(n_rows,))
-
-		for idx, rec in enumerate(records):
-			if isinstance(rec, str):
-				parsed = _parse_line(rec, self.headers)
+		lock_path = self._cache_paths.get("lock") if self._cache_paths else None
+		if lock_path is not None:
+			with open(lock_path, "w") as fp:
+				fp.write(f"{os.getpid()}\n")
+		try:
+			if _is_parquet(self.f_path):
+				df_reads = pd.read_parquet(self.f_path)
+				self.headers = df_reads.columns.tolist()
+				required_headers = ["dna_seq", "methyl_seq", "ctype", "dmr_ctype", "dmr_label"]
+				if not all([h in self.headers for h in required_headers]):
+					raise ValueError("The header must contain dna_seq, methyl_seq, ctype, dmr_ctype, dmr_label")
+				if n_seqs is not None:
+					df_reads = df_reads.head(n_seqs)
+				records = df_reads.to_dict("records")
+				del df_reads
 			else:
-				parsed = rec
-				parsed["ctype_label"] = int(parsed["ctype"] == parsed["dmr_ctype"])
-				parsed["dmr_label"] = int(parsed["dmr_label"])
+				with _open_text(self.f_path) as f_input:
+					raw_seqs = f_input.read().splitlines()
+				self.headers = raw_seqs[0].split("\t")
+				raw_seqs = raw_seqs[1:]
+				if n_seqs is not None:
+					raw_seqs = raw_seqs[:n_seqs]
+				records = raw_seqs
 
-			item = _line2tokens_finetune(
-				l=parsed,
-				tokenizer=self.vocab, max_len=self.seq_len, headers=self.headers)
+			n_rows = len(records)
+			print("Pre-tokenizing sequences : ", n_rows)
 
-			dna_seq = np.array(item["dna_seq"], dtype=np.int32).squeeze()
-			methyl_seq = np.array(item["methyl_seq"], dtype=np.int8).squeeze()
+			dna_mm = np.lib.format.open_memmap(self._cache_paths["dna"], mode="w+", dtype=np.int32, shape=(n_rows, self.seq_len + 1))
+			methyl_mm = np.lib.format.open_memmap(self._cache_paths["methyl"], mode="w+", dtype=np.int8, shape=(n_rows, self.seq_len + 1))
+			dmr_label_mm = np.lib.format.open_memmap(self._cache_paths["dmr_label"], mode="w+", dtype=np.int32, shape=(n_rows,))
+			ctype_label_mm = np.lib.format.open_memmap(self._cache_paths["ctype_label"], mode="w+", dtype=np.int8, shape=(n_rows,))
 
-			non_pad = np.where(dna_seq != self.vocab.pad_index)[0]
-			if non_pad.size > 0:
-				end = non_pad[-1] + 1
-				if end < dna_seq.shape[0]:
-					dna_seq[end] = self.vocab.eos_index
-					methyl_seq[end] = 2
+			for idx, rec in enumerate(records):
+				if isinstance(rec, str):
+					parsed = _parse_line(rec, self.headers)
 				else:
-					dna_seq[-1] = self.vocab.eos_index
-					methyl_seq[-1] = 2
+					parsed = rec
+					parsed["ctype_label"] = int(parsed["ctype"] == parsed["dmr_ctype"])
+					parsed["dmr_label"] = int(parsed["dmr_label"])
 
-			dna_seq = np.concatenate([[self.vocab.sos_index], dna_seq])
-			methyl_seq = np.concatenate([[2], methyl_seq])
+				item = _line2tokens_finetune(
+					l=parsed,
+					tokenizer=self.vocab, max_len=self.seq_len, headers=self.headers)
 
-			dna_mm[idx] = dna_seq
-			methyl_mm[idx] = methyl_seq
-			dmr_label_mm[idx] = parsed["dmr_label"]
-			ctype_label_mm[idx] = parsed["ctype_label"]
+				dna_seq = np.array(item["dna_seq"], dtype=np.int32).squeeze()
+				methyl_seq = np.array(item["methyl_seq"], dtype=np.int8).squeeze()
 
-		meta = {
-			"seq_len": self.seq_len,
-			"source": os.path.abspath(self.f_path),
-			"rows": n_rows,
-			"version": 1,
-		}
-		with open(self._cache_paths["meta"], "w") as fp:
-			json.dump(meta, fp)
+				non_pad = np.where(dna_seq != self.vocab.pad_index)[0]
+				if non_pad.size > 0:
+					end = non_pad[-1] + 1
+					if end < dna_seq.shape[0]:
+						dna_seq[end] = self.vocab.eos_index
+						methyl_seq[end] = 2
+					else:
+						dna_seq[-1] = self.vocab.eos_index
+						methyl_seq[-1] = 2
 
-		del dna_mm, methyl_mm, dmr_label_mm, ctype_label_mm
-		gc.collect()
+				dna_seq = np.concatenate([[self.vocab.sos_index], dna_seq])
+				methyl_seq = np.concatenate([[2], methyl_seq])
+
+				dna_mm[idx] = dna_seq
+				methyl_mm[idx] = methyl_seq
+				dmr_label_mm[idx] = parsed["dmr_label"]
+				ctype_label_mm[idx] = parsed["ctype_label"]
+
+			meta = {
+				"seq_len": self.seq_len,
+				"source": os.path.abspath(self.f_path),
+				"rows": n_rows,
+				"kmer": self.vocab.kmers,
+				"version": 1,
+			}
+			with open(self._cache_paths["meta"], "w") as fp:
+				json.dump(meta, fp)
+
+			del dna_mm, methyl_mm, dmr_label_mm, ctype_label_mm
+			gc.collect()
+		finally:
+			if lock_path is not None and os.path.exists(lock_path):
+				os.remove(lock_path)
+
+	def _wait_for_token_cache(self, timeout_s: int = 3600, poll_s: int = 5, wait_for_refresh: bool = False):
+		if not self._cache_paths:
+			return
+		cache_files = ("dna", "methyl", "dmr_label", "ctype_label", "meta")
+		lock_path = self._cache_paths.get("lock")
+		meta_path = self._cache_paths.get("meta")
+		initial_mtime = os.path.getmtime(meta_path) if meta_path and os.path.exists(meta_path) else None
+		saw_missing = False
+		start = time.time()
+		wait_logged = False
+		while True:
+			if wait_for_refresh and meta_path and not os.path.exists(meta_path):
+				saw_missing = True
+			cache_ready = all(os.path.exists(self._cache_paths[k]) for k in cache_files)
+			lock_exists = lock_path is not None and os.path.exists(lock_path)
+			if cache_ready and not lock_exists:
+				if wait_for_refresh and initial_mtime is not None and meta_path and os.path.exists(meta_path):
+					if os.path.getmtime(meta_path) > initial_mtime or saw_missing:
+						return
+				else:
+					return
+			if not wait_logged:
+				print(f"Waiting for token cache build: {self._cache_paths['meta']}")
+				wait_logged = True
+			if timeout_s is not None and (time.time() - start) > timeout_s:
+				missing = [k for k in cache_files if not os.path.exists(self._cache_paths[k])]
+				raise TimeoutError(f"Timed out waiting for token cache. Missing: {missing}")
+			time.sleep(poll_s)
 
 	def _load_token_cache(self):
 		with open(self._cache_paths["meta"], "r") as fp:
 			meta = json.load(fp)
 		if int(meta.get("seq_len", -1)) != self.seq_len:
 			raise ValueError("Token cache seq_len does not match dataset seq_len.")
+		meta_kmer = int(meta.get("kmer", self.vocab.kmers))
+		if meta_kmer != self.vocab.kmers:
+			raise ValueError("Token cache kmer does not match dataset kmer.")
 
 		self._dna_cache = np.load(self._cache_paths["dna"], mmap_mode="r")
 		self._methyl_cache = np.load(self._cache_paths["methyl"], mmap_mode="r")

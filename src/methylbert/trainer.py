@@ -648,6 +648,7 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
         scaler = GradScaler() if self._config.amp else None
 
+        pad_idx = self.train_data.dataset.vocab.pad_index if self.train_data is not None else 0
         duration = 0
         epoch_progress_bar = tqdm(total=epochs, desc="Training...", disable=not self.is_rank0)
         for epoch in range(epochs):
@@ -722,6 +723,10 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     and ((local_step+1) % self._config.eval_freq == 0 or local_step == 0)
                     and self.test_data is not None
                 )
+                if _ddp_enabled():
+                    eval_flag = torch.tensor(1 if (self.is_rank0 and do_eval) else 0, device=self.device)
+                    dist.broadcast(eval_flag, src=0)
+                    do_eval = bool(eval_flag.item())
                 if do_eval:
                     if _ddp_enabled():
                         dist.barrier()
