@@ -796,21 +796,37 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
             if steps == self.step:
                 break
 
-    def save(self, file_path: str="output/bert_trained.model"):
-        '''
-        Save the MethylBERT model in the given path
-        '''
-        self.bert.to("cpu")
-        self.bert.save_pretrained(file_path)
+    def save(self, file_path: str = "output/bert_trained.model"):
+        # Only rank 0 saves
+        if hasattr(self, "is_rank0") and not self.is_rank0:
+            return
 
-        if hasattr(self.bert, "read_classifier"):
-            torch.save(self.bert.read_classifier.state_dict(), os.path.dirname(file_path)+"/read_classification_model.pickle")
+        os.makedirs(file_path, exist_ok=True)
 
-        if hasattr(self.bert, "dmr_encoder"):
-            torch.save(self.bert.dmr_encoder.state_dict(), os.path.dirname(file_path)+"/dmr_encoder.pickle")
+        # Unwrap DDP safely
+        model_to_save = self.model.module if isinstance(self.model, DDP) else self.model
 
-        self.bert.to(self.device)
-        print("Step:%d Model Saved on:" % self.step, file_path)
+        # Snapshot weights to CPU without touching the live model
+        state_dict = {k: v.detach().cpu() for k, v in model_to_save.state_dict().items()}
+
+        # HuggingFace-compatible save, but no distributed ops
+        model_to_save.save_pretrained(file_path, state_dict=state_dict)
+
+        # Optional extras (still safe)
+        if hasattr(model_to_save, "read_classifier"):
+            torch.save(
+                model_to_save.read_classifier.state_dict(),
+                os.path.join(file_path, "read_classification_model.pickle"),
+            )
+
+        if hasattr(model_to_save, "dmr_encoder"):
+            torch.save(
+                model_to_save.dmr_encoder.state_dict(),
+                os.path.join(file_path, "dmr_encoder.pickle"),
+            )
+
+        print(f"Step:{self.step} Model Saved on: {file_path}", flush=True)
+
 
     def load(self, dir_path: str, n_dmrs: int=None, load_fine_tune: bool=False):
         '''
