@@ -530,7 +530,10 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
 
         mean_loss = 0
         pad_idx = self.train_data.dataset.vocab.pad_index if self.train_data is not None else 0
-        use_ddp_metrics = _ddp_enabled() and not return_logits
+        if _ddp_enabled() and not self.is_rank0:
+            return None, None, None
+
+        use_ddp_metrics = _ddp_enabled() and self.is_rank0 and not return_logits
         local_correct = 0
         local_total = 0
         local_loss_sum = 0.0
@@ -723,6 +726,8 @@ class MethylBertFinetuneTrainer(MethylBertTrainer):
                     and ((local_step+1) % self._config.eval_freq == 0 or local_step == 0)
                     and self.test_data is not None
                 )
+                if _ddp_enabled() and not self.is_rank0:
+                    do_eval = False
                 if do_eval:
                     should_save_freq = (type(self._config.save_freq) == int) and (self.step % self._config.save_freq == 0)
 

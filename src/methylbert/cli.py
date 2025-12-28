@@ -158,6 +158,7 @@ def run_finetune(args):
 			num_replicas=int(os.environ["WORLD_SIZE"]),
 			rank=int(os.environ["RANK"]),
 			shuffle=True,
+			drop_last=True,
 		)
 
 	train_data_loader = DataLoader(
@@ -167,6 +168,7 @@ def run_finetune(args):
 		pin_memory=args.with_cuda,
 		shuffle=train_sampler is None,
 		sampler=train_sampler,
+		drop_last=True if train_sampler is not None else False,
 	)
 
 	if args.valid_batch < 0:
@@ -179,8 +181,17 @@ def run_finetune(args):
 			num_replicas=int(os.environ["WORLD_SIZE"]),
 			rank=int(os.environ["RANK"]),
 			shuffle=False,
+			drop_last=True,
 		)
-	test_data_loader = DataLoader(test_dataset, batch_size=args.valid_batch, num_workers=args.num_workers, pin_memory=args.with_cuda,  shuffle=False, sampler=test_sampler) if args.test_dataset is not None else None
+	test_data_loader = DataLoader(
+		test_dataset,
+		batch_size=args.valid_batch,
+		num_workers=args.num_workers,
+		pin_memory=args.with_cuda,
+		shuffle=False,
+		sampler=test_sampler,
+		drop_last=True if test_sampler is not None else False,
+	) if args.test_dataset is not None else None
 
 	# BERT train
 	print("Creating BERT Trainer")
