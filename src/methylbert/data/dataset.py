@@ -301,7 +301,7 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 	def __init__(self, f_path: str, vocab: MethylVocab, seq_len: int, n_cores: int=10, n_seqs = None,
 				 token_cache_dir: str = None, rebuild_token_cache: bool = False,
 				 token_cache_timeout_s: int = 3600, token_cache_workers: int = None,
-				 token_cache_progress: bool = False):
+				 token_cache_progress: bool = False, token_cache_mode: str = "auto"):
 		'''
 		MethylBERT dataset
 
@@ -325,6 +325,8 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			Workers to use for token cache build (default: all CPUs).
 		token_cache_progress: bool
 			Show a progress bar during token cache build (default: False).
+		token_cache_mode: str
+			Cache behavior: auto (build if missing), build (force build), load (load only).
 
 		'''
 		self.vocab = vocab
@@ -337,6 +339,7 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		if self._token_cache_workers is not None and self._token_cache_workers <= 0:
 			self._token_cache_workers = None
 		self._token_cache_progress = token_cache_progress
+		self._token_cache_mode = token_cache_mode or "auto"
 
 		if token_cache_timeout_s is not None and token_cache_timeout_s <= 0:
 			token_cache_timeout_s = None
@@ -362,9 +365,14 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			cache_ready = all(os.path.exists(self._cache_paths[k]) for k in cache_files)
 			torchrun_rank = _torchrun_rank()
 			can_build_cache = torchrun_rank is None or torchrun_rank == 0
-			if cache_ready and not rebuild_token_cache:
+			if self._token_cache_mode == "load":
+				if not cache_ready:
+					missing = [k for k in cache_files if not os.path.exists(self._cache_paths[k])]
+					raise FileNotFoundError(
+						f"Token cache missing: {missing}. Run build_token_cache first."
+					)
 				self._load_token_cache()
-			else:
+			elif self._token_cache_mode == "build":
 				if can_build_cache:
 					built = self._build_token_cache(n_seqs=n_seqs)
 					if not built:
@@ -378,6 +386,23 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 						wait_for_refresh=rebuild_token_cache,
 					)
 				self._load_token_cache()
+			else:
+				if cache_ready and not rebuild_token_cache:
+					self._load_token_cache()
+				else:
+					if can_build_cache:
+						built = self._build_token_cache(n_seqs=n_seqs)
+						if not built:
+							self._wait_for_token_cache(
+								timeout_s=token_cache_timeout_s,
+								wait_for_refresh=rebuild_token_cache,
+							)
+					else:
+						self._wait_for_token_cache(
+							timeout_s=token_cache_timeout_s,
+							wait_for_refresh=rebuild_token_cache,
+						)
+					self._load_token_cache()
 
 		if self._use_token_cache:
 			return

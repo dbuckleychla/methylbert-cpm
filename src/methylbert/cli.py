@@ -19,6 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 OPTIONS = [
 	"preprocess_finetune", 
 	"finetune", 
+	"build_token_cache",
 	"deconvolute"
 ]
 
@@ -80,14 +81,23 @@ def finetune_arg_parser(subparsers):
 	parser.add_argument("--adam_beta2", type=float, default=0.98, help="adamW second beta value (default: 0.98)")
 	parser.add_argument("--warm_up", type=int, default=100, help="steps for warm-up (default: 100)")
 	parser.add_argument("--decrease_steps", type=int, default=200, help="step to decrease the learning rate (default: 200)")
-	parser.add_argument("--token_cache_dir", type=str, default=None, help="Directory for pre-tokenized finetune arrays (default: None)")
+	parser.add_argument("--token_cache_dir", type=str, default=None, help="Directory for pre-tokenized finetune arrays (build with build_token_cache)")
+
+	# Others
+	parser.add_argument("--seed", type=int, default=950410, help="seed number (default: 950410)")
+
+def build_token_cache_arg_parser(subparsers):
+	parser = subparsers.add_parser('build_token_cache', help='Build token cache for fine-tuning')
+
+	parser.add_argument("-c", "--train_dataset", required=True, type=str, help="dataset to pre-tokenize")
+	parser.add_argument("-nm", "--n_mers", type=int, default=3, help="n-mers (default: 3)")
+	parser.add_argument("-s", "--seq_len", type=int, default=150, help="maximum sequence len (default: 150)")
+	parser.add_argument("--token_cache_dir", required=True, type=str, help="Directory for pre-tokenized finetune arrays")
 	parser.add_argument("--rebuild_token_cache", default=False, action="store_true", help="Rebuild token cache even if present (default: False)")
 	parser.add_argument("--token_cache_timeout", type=int, default=3600, help="Seconds to wait for token cache build (default: 3600). Use 0 to wait indefinitely.")
 	parser.add_argument("--token_cache_workers", type=int, default=0, help="Workers for token cache build (default: 0 uses all CPUs).")
 	parser.add_argument("--token_cache_progress", default=False, action="store_true", help="Show a progress bar while building token cache (default: False).")
-
-	# Others
-	parser.add_argument("--seed", type=int, default=950410, help="seed number (default: 950410)")
+	parser.add_argument("--output_path", type=str, default=None, help="Optional directory to write the build configuration")
 	
 def preprocess_finetune_arg_parser(subparsers):
 
@@ -137,10 +147,7 @@ def run_finetune(args):
 	train_dataset = MethylBertFinetuneDataset(args.train_dataset, tokenizer, 
 											  seq_len=args.seq_len,
 											  token_cache_dir=args.token_cache_dir,
-											  rebuild_token_cache=args.rebuild_token_cache,
-											  token_cache_timeout_s=args.token_cache_timeout,
-											  token_cache_workers=args.token_cache_workers,
-											  token_cache_progress=args.token_cache_progress)
+											  token_cache_mode="load")
 
 	print("%d seqs with %d labels "%(len(train_dataset), train_dataset.num_dmrs()))
 	print("Loading Test Dataset:", args.test_dataset)
@@ -149,10 +156,7 @@ def run_finetune(args):
 		test_dataset = MethylBertFinetuneDataset(args.test_dataset, tokenizer, 
 								   				 seq_len=args.seq_len,
 												 token_cache_dir=args.token_cache_dir,
-												 rebuild_token_cache=args.rebuild_token_cache,
-												 token_cache_timeout_s=args.token_cache_timeout,
-												 token_cache_workers=args.token_cache_workers,
-												 token_cache_progress=args.token_cache_progress) 
+												 token_cache_mode="load") 
 
 	# Create a data loader
 	print("Creating Dataloader")
@@ -238,6 +242,26 @@ def run_finetune(args):
 	# Fine-tune
 	print("Training Start")
 	trainer.train(args.steps)
+
+def run_build_token_cache(args):
+	# Create a tokenizer
+	print("Create a tokenizer for %d-mers"%(args.n_mers))
+	tokenizer=MethylVocab(k=args.n_mers)
+	print("Vocab Size: ", len(tokenizer))
+
+	print("Building Token Cache:", args.train_dataset)
+	MethylBertFinetuneDataset(
+		args.train_dataset,
+		tokenizer,
+		seq_len=args.seq_len,
+		token_cache_dir=args.token_cache_dir,
+		rebuild_token_cache=args.rebuild_token_cache,
+		token_cache_timeout_s=args.token_cache_timeout,
+		token_cache_workers=args.token_cache_workers,
+		token_cache_progress=args.token_cache_progress,
+		token_cache_mode="build",
+	)
+	print("Token cache build complete.")
 
 def run_deconvolute(args):
 	# Reload training parameters 
@@ -331,6 +355,8 @@ def get_args(func):
 		preprocess_finetune_arg_parser(subparsers)
 	elif func == "finetune":
 		finetune_arg_parser(subparsers)
+	elif func == "build_token_cache":
+		build_token_cache_arg_parser(subparsers)
 	elif func == "deconvolute":
 		deconvolute_arg_parser(subparsers)
 	else:
@@ -342,8 +368,13 @@ def get_args(func):
 		with open(f_config, "r") as fp:
 			config_dict = json.load(fp)
 
+		subparser = subparsers.choices.get(func)
+		valid_dests = {action.dest for action in subparser._actions} if subparser else set()
+
 		args = [func]
 		for k, v in config_dict.items():
+			if k not in valid_dests:
+				continue
 			if ( type(v) == bool ) and (v):
 				args.append(f"--{k}")
 			elif v is not None:
@@ -355,10 +386,11 @@ def get_args(func):
 		# parse args
 		args = parser_init.parse_args()
 	
-		# output configuration in a .json file
-		if not os.path.exists(args.output_path):
-			os.mkdir(args.output_path)
-		write_args2json(args, os.path.join(args.output_path, f"{func}_config.json"))
+		# output configuration in a .json file (if output_path is provided)
+		if hasattr(args, "output_path") and args.output_path:
+			if not os.path.exists(args.output_path):
+				os.mkdir(args.output_path)
+			write_args2json(args, os.path.join(args.output_path, f"{func}_config.json"))
 
 	return args
 
@@ -377,6 +409,8 @@ def main(args=None):
 		run_preprocess(args)
 	elif selected_option == "finetune":
 		run_finetune(args)
+	elif selected_option == "build_token_cache":
+		run_build_token_cache(args)
 	elif selected_option == "deconvolute":
 		run_deconvolute(args)
 
