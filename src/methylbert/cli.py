@@ -84,6 +84,7 @@ def finetune_arg_parser(subparsers):
 	parser.add_argument("--rebuild_token_cache", default=False, action="store_true", help="Rebuild token cache even if present (default: False)")
 	parser.add_argument("--token_cache_timeout", type=int, default=3600, help="Seconds to wait for token cache build (default: 3600). Use 0 to wait indefinitely.")
 	parser.add_argument("--token_cache_workers", type=int, default=0, help="Workers for token cache build (default: 0 uses all CPUs).")
+	parser.add_argument("--token_cache_progress", default=False, action="store_true", help="Show a progress bar while building token cache (default: False).")
 
 	# Others
 	parser.add_argument("--seed", type=int, default=950410, help="seed number (default: 950410)")
@@ -138,7 +139,8 @@ def run_finetune(args):
 											  token_cache_dir=args.token_cache_dir,
 											  rebuild_token_cache=args.rebuild_token_cache,
 											  token_cache_timeout_s=args.token_cache_timeout,
-											  token_cache_workers=args.token_cache_workers)
+											  token_cache_workers=args.token_cache_workers,
+											  token_cache_progress=args.token_cache_progress)
 
 	print("%d seqs with %d labels "%(len(train_dataset), train_dataset.num_dmrs()))
 	print("Loading Test Dataset:", args.test_dataset)
@@ -149,7 +151,8 @@ def run_finetune(args):
 												 token_cache_dir=args.token_cache_dir,
 												 rebuild_token_cache=args.rebuild_token_cache,
 												 token_cache_timeout_s=args.token_cache_timeout,
-												 token_cache_workers=args.token_cache_workers) 
+												 token_cache_workers=args.token_cache_workers,
+												 token_cache_progress=args.token_cache_progress) 
 
 	# Create a data loader
 	print("Creating Dataloader")

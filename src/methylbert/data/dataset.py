@@ -17,6 +17,10 @@ import torch
 from torch.utils.data import Dataset
 
 from methylbert.data.vocab import MethylVocab
+try:
+	from tqdm import tqdm
+except Exception:
+	tqdm = None
 
 
 def _open_text(path: str):
@@ -296,7 +300,8 @@ class MethylBertPretrainDataset(MethylBertDataset):
 class MethylBertFinetuneDataset(MethylBertDataset):
 	def __init__(self, f_path: str, vocab: MethylVocab, seq_len: int, n_cores: int=10, n_seqs = None,
 				 token_cache_dir: str = None, rebuild_token_cache: bool = False,
-				 token_cache_timeout_s: int = 3600, token_cache_workers: int = None):
+				 token_cache_timeout_s: int = 3600, token_cache_workers: int = None,
+				 token_cache_progress: bool = False):
 		'''
 		MethylBERT dataset
 
@@ -318,6 +323,8 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			Seconds to wait for token cache (default: 3600). Set to 0 or negative to wait indefinitely.
 		token_cache_workers: int
 			Workers to use for token cache build (default: all CPUs).
+		token_cache_progress: bool
+			Show a progress bar during token cache build (default: False).
 
 		'''
 		self.vocab = vocab
@@ -329,6 +336,7 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		self._token_cache_workers = token_cache_workers
 		if self._token_cache_workers is not None and self._token_cache_workers <= 0:
 			self._token_cache_workers = None
+		self._token_cache_progress = token_cache_progress
 
 		if token_cache_timeout_s is not None and token_cache_timeout_s <= 0:
 			token_cache_timeout_s = None
@@ -419,6 +427,9 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 	def _build_token_cache(self, n_seqs=None):
 		lock_path = self._cache_paths.get("lock") if self._cache_paths else None
 		lock_acquired = False
+		progress = None
+		progress_update_every = None
+		progress_count = 0
 		if lock_path is not None:
 			try:
 				fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -452,6 +463,10 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			n_rows = len(records)
 			print("Pre-tokenizing sequences : ", n_rows)
 
+			if self._token_cache_progress and tqdm is not None and n_rows:
+				progress = tqdm(total=n_rows, unit="seq", mininterval=1.0, smoothing=0.05)
+				progress_update_every = max(1, min(10000, n_rows // 1000 or 1))
+
 			dna_mm = np.lib.format.open_memmap(self._cache_paths["dna"], mode="w+", dtype=np.int32, shape=(n_rows, self.seq_len + 1))
 			methyl_mm = np.lib.format.open_memmap(self._cache_paths["methyl"], mode="w+", dtype=np.int8, shape=(n_rows, self.seq_len + 1))
 			dmr_label_mm = np.lib.format.open_memmap(self._cache_paths["dmr_label"], mode="w+", dtype=np.int32, shape=(n_rows,))
@@ -478,6 +493,10 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 						methyl_mm[idx] = methyl_seq
 						dmr_label_mm[idx] = dmr_label
 						ctype_label_mm[idx] = ctype_label
+						if progress is not None:
+							progress_count += 1
+							if progress_count % progress_update_every == 0:
+								progress.update(progress_update_every)
 			else:
 				for idx, rec in enumerate(records):
 					if isinstance(rec, str):
@@ -511,6 +530,10 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 					methyl_mm[idx] = methyl_seq
 					dmr_label_mm[idx] = parsed["dmr_label"]
 					ctype_label_mm[idx] = parsed["ctype_label"]
+					if progress is not None:
+						progress_count += 1
+						if progress_count % progress_update_every == 0:
+							progress.update(progress_update_every)
 
 			meta = {
 				"seq_len": self.seq_len,
@@ -525,6 +548,11 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			del dna_mm, methyl_mm, dmr_label_mm, ctype_label_mm
 			gc.collect()
 		finally:
+			if progress is not None:
+				remainder = progress_count % progress_update_every if progress_update_every else 0
+				if remainder:
+					progress.update(remainder)
+				progress.close()
 			if lock_path is not None and lock_acquired and os.path.exists(lock_path):
 				os.remove(lock_path)
 		return True
