@@ -32,6 +32,16 @@ def _is_parquet(path: str) -> bool:
 	path = path.lower()
 	return path.endswith(".parquet") or path.endswith(".pq")
 
+def _torchrun_rank():
+	rank = os.environ.get("RANK")
+	world_size = os.environ.get("WORLD_SIZE")
+	if rank is None or world_size is None:
+		return None
+	try:
+		return int(rank)
+	except ValueError:
+		return None
+
 def _token_cache_prefix(f_path: str, seq_len: int, kmer: int, cache_dir: str, n_seqs: int = None) -> str:
 	abs_path = os.path.abspath(f_path)
 	hash_id = hashlib.md5(abs_path.encode("utf-8")).hexdigest()[:10]
@@ -89,6 +99,52 @@ def _line2tokens_finetune(l, tokenizer, max_len=150, headers=None):
 		l["methyl_seq"] = l["methyl_seq"] + [2 for k in range(max_len-cur_seq_len)]
 
 	return l
+
+_TOKEN_CACHE_WORKER_CTX = {}
+
+def _init_token_cache_worker(vocab, seq_len, headers):
+	global _TOKEN_CACHE_WORKER_CTX
+	_TOKEN_CACHE_WORKER_CTX = {
+		"vocab": vocab,
+		"seq_len": seq_len,
+		"headers": headers,
+	}
+
+def _tokenize_cache_record(args):
+	idx, rec = args
+	ctx = _TOKEN_CACHE_WORKER_CTX
+	tokenizer = ctx["vocab"]
+	seq_len = ctx["seq_len"]
+	headers = ctx["headers"]
+
+	if isinstance(rec, str):
+		parsed = _parse_line(rec, headers)
+	else:
+		parsed = rec
+		parsed["ctype_label"] = int(parsed["ctype"] == parsed["dmr_ctype"])
+		parsed["dmr_label"] = int(parsed["dmr_label"])
+
+	item = _line2tokens_finetune(
+		l=parsed,
+		tokenizer=tokenizer, max_len=seq_len, headers=headers)
+
+	dna_seq = np.array(item["dna_seq"], dtype=np.int32).squeeze()
+	methyl_seq = np.array(item["methyl_seq"], dtype=np.int8).squeeze()
+
+	non_pad = np.where(dna_seq != tokenizer.pad_index)[0]
+	if non_pad.size > 0:
+		end = non_pad[-1] + 1
+		if end < dna_seq.shape[0]:
+			dna_seq[end] = tokenizer.eos_index
+			methyl_seq[end] = 2
+		else:
+			dna_seq[-1] = tokenizer.eos_index
+			methyl_seq[-1] = 2
+
+	dna_seq = np.concatenate([[tokenizer.sos_index], dna_seq])
+	methyl_seq = np.concatenate([[2], methyl_seq])
+
+	return idx, dna_seq, methyl_seq, parsed["dmr_label"], parsed["ctype_label"]
 
 class MethylBertDataset(Dataset):
 	def __init__(self):
@@ -239,7 +295,8 @@ class MethylBertPretrainDataset(MethylBertDataset):
 
 class MethylBertFinetuneDataset(MethylBertDataset):
 	def __init__(self, f_path: str, vocab: MethylVocab, seq_len: int, n_cores: int=10, n_seqs = None,
-				 token_cache_dir: str = None, rebuild_token_cache: bool = False):
+				 token_cache_dir: str = None, rebuild_token_cache: bool = False,
+				 token_cache_timeout_s: int = 3600, token_cache_workers: int = None):
 		'''
 		MethylBERT dataset
 
@@ -257,6 +314,10 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			Directory to store/load pre-tokenized arrays (default: None)
 		rebuild_token_cache: bool
 			Rebuild token cache even if present (default: False)
+		token_cache_timeout_s: int
+			Seconds to wait for token cache (default: 3600). Set to 0 or negative to wait indefinitely.
+		token_cache_workers: int
+			Workers to use for token cache build (default: all CPUs).
 
 		'''
 		self.vocab = vocab
@@ -265,6 +326,12 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 		self._use_token_cache = False
 		self._length = None
 		self._cache_paths = None
+		self._token_cache_workers = token_cache_workers
+		if self._token_cache_workers is not None and self._token_cache_workers <= 0:
+			self._token_cache_workers = None
+
+		if token_cache_timeout_s is not None and token_cache_timeout_s <= 0:
+			token_cache_timeout_s = None
 
 		if token_cache_dir is not None:
 			os.makedirs(token_cache_dir, exist_ok=True)
@@ -285,12 +352,23 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			}
 			cache_files = ("dna", "methyl", "dmr_label", "ctype_label", "meta")
 			cache_ready = all(os.path.exists(self._cache_paths[k]) for k in cache_files)
+			torchrun_rank = _torchrun_rank()
+			can_build_cache = torchrun_rank is None or torchrun_rank == 0
 			if cache_ready and not rebuild_token_cache:
 				self._load_token_cache()
 			else:
-				built = self._build_token_cache(n_seqs=n_seqs)
-				if not built:
-					self._wait_for_token_cache(wait_for_refresh=rebuild_token_cache)
+				if can_build_cache:
+					built = self._build_token_cache(n_seqs=n_seqs)
+					if not built:
+						self._wait_for_token_cache(
+							timeout_s=token_cache_timeout_s,
+							wait_for_refresh=rebuild_token_cache,
+						)
+				else:
+					self._wait_for_token_cache(
+						timeout_s=token_cache_timeout_s,
+						wait_for_refresh=rebuild_token_cache,
+					)
 				self._load_token_cache()
 
 		if self._use_token_cache:
@@ -379,38 +457,60 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			dmr_label_mm = np.lib.format.open_memmap(self._cache_paths["dmr_label"], mode="w+", dtype=np.int32, shape=(n_rows,))
 			ctype_label_mm = np.lib.format.open_memmap(self._cache_paths["ctype_label"], mode="w+", dtype=np.int8, shape=(n_rows,))
 
-			for idx, rec in enumerate(records):
-				if isinstance(rec, str):
-					parsed = _parse_line(rec, self.headers)
-				else:
-					parsed = rec
-					parsed["ctype_label"] = int(parsed["ctype"] == parsed["dmr_ctype"])
-					parsed["dmr_label"] = int(parsed["dmr_label"])
+			token_cache_workers = self._token_cache_workers
+			if token_cache_workers is None or token_cache_workers <= 0:
+				token_cache_workers = os.cpu_count() or 1
+			token_cache_workers = min(token_cache_workers, n_rows) if n_rows else 1
 
-				item = _line2tokens_finetune(
-					l=parsed,
-					tokenizer=self.vocab, max_len=self.seq_len, headers=self.headers)
-
-				dna_seq = np.array(item["dna_seq"], dtype=np.int32).squeeze()
-				methyl_seq = np.array(item["methyl_seq"], dtype=np.int8).squeeze()
-
-				non_pad = np.where(dna_seq != self.vocab.pad_index)[0]
-				if non_pad.size > 0:
-					end = non_pad[-1] + 1
-					if end < dna_seq.shape[0]:
-						dna_seq[end] = self.vocab.eos_index
-						methyl_seq[end] = 2
+			if token_cache_workers > 1:
+				chunk_size = max(1, min(1000, n_rows // (token_cache_workers * 4) or 1))
+				with mp.Pool(
+					token_cache_workers,
+					initializer=_init_token_cache_worker,
+					initargs=(self.vocab, self.seq_len, self.headers),
+				) as pool:
+					for idx, dna_seq, methyl_seq, dmr_label, ctype_label in pool.imap_unordered(
+						_tokenize_cache_record,
+						enumerate(records),
+						chunksize=chunk_size,
+					):
+						dna_mm[idx] = dna_seq
+						methyl_mm[idx] = methyl_seq
+						dmr_label_mm[idx] = dmr_label
+						ctype_label_mm[idx] = ctype_label
+			else:
+				for idx, rec in enumerate(records):
+					if isinstance(rec, str):
+						parsed = _parse_line(rec, self.headers)
 					else:
-						dna_seq[-1] = self.vocab.eos_index
-						methyl_seq[-1] = 2
+						parsed = rec
+						parsed["ctype_label"] = int(parsed["ctype"] == parsed["dmr_ctype"])
+						parsed["dmr_label"] = int(parsed["dmr_label"])
 
-				dna_seq = np.concatenate([[self.vocab.sos_index], dna_seq])
-				methyl_seq = np.concatenate([[2], methyl_seq])
+					item = _line2tokens_finetune(
+						l=parsed,
+						tokenizer=self.vocab, max_len=self.seq_len, headers=self.headers)
 
-				dna_mm[idx] = dna_seq
-				methyl_mm[idx] = methyl_seq
-				dmr_label_mm[idx] = parsed["dmr_label"]
-				ctype_label_mm[idx] = parsed["ctype_label"]
+					dna_seq = np.array(item["dna_seq"], dtype=np.int32).squeeze()
+					methyl_seq = np.array(item["methyl_seq"], dtype=np.int8).squeeze()
+
+					non_pad = np.where(dna_seq != self.vocab.pad_index)[0]
+					if non_pad.size > 0:
+						end = non_pad[-1] + 1
+						if end < dna_seq.shape[0]:
+							dna_seq[end] = self.vocab.eos_index
+							methyl_seq[end] = 2
+						else:
+							dna_seq[-1] = self.vocab.eos_index
+							methyl_seq[-1] = 2
+
+					dna_seq = np.concatenate([[self.vocab.sos_index], dna_seq])
+					methyl_seq = np.concatenate([[2], methyl_seq])
+
+					dna_mm[idx] = dna_seq
+					methyl_mm[idx] = methyl_seq
+					dmr_label_mm[idx] = parsed["dmr_label"]
+					ctype_label_mm[idx] = parsed["ctype_label"]
 
 			meta = {
 				"seq_len": self.seq_len,

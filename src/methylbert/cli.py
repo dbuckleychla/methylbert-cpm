@@ -82,6 +82,8 @@ def finetune_arg_parser(subparsers):
 	parser.add_argument("--decrease_steps", type=int, default=200, help="step to decrease the learning rate (default: 200)")
 	parser.add_argument("--token_cache_dir", type=str, default=None, help="Directory for pre-tokenized finetune arrays (default: None)")
 	parser.add_argument("--rebuild_token_cache", default=False, action="store_true", help="Rebuild token cache even if present (default: False)")
+	parser.add_argument("--token_cache_timeout", type=int, default=3600, help="Seconds to wait for token cache build (default: 3600). Use 0 to wait indefinitely.")
+	parser.add_argument("--token_cache_workers", type=int, default=0, help="Workers for token cache build (default: 0 uses all CPUs).")
 
 	# Others
 	parser.add_argument("--seed", type=int, default=950410, help="seed number (default: 950410)")
@@ -134,7 +136,9 @@ def run_finetune(args):
 	train_dataset = MethylBertFinetuneDataset(args.train_dataset, tokenizer, 
 											  seq_len=args.seq_len,
 											  token_cache_dir=args.token_cache_dir,
-											  rebuild_token_cache=args.rebuild_token_cache)
+											  rebuild_token_cache=args.rebuild_token_cache,
+											  token_cache_timeout_s=args.token_cache_timeout,
+											  token_cache_workers=args.token_cache_workers)
 
 	print("%d seqs with %d labels "%(len(train_dataset), train_dataset.num_dmrs()))
 	print("Loading Test Dataset:", args.test_dataset)
@@ -143,7 +147,9 @@ def run_finetune(args):
 		test_dataset = MethylBertFinetuneDataset(args.test_dataset, tokenizer, 
 								   				 seq_len=args.seq_len,
 												 token_cache_dir=args.token_cache_dir,
-												 rebuild_token_cache=args.rebuild_token_cache) 
+												 rebuild_token_cache=args.rebuild_token_cache,
+												 token_cache_timeout_s=args.token_cache_timeout,
+												 token_cache_workers=args.token_cache_workers) 
 
 	# Create a data loader
 	print("Creating Dataloader")
