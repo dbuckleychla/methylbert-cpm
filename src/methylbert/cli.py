@@ -1,4 +1,5 @@
 import argparse, sys, os, json
+import random
 
 import pickle as pk
 import pandas as pd
@@ -13,7 +14,7 @@ from methylbert.deconvolute import deconvolute
 from methylbert import __version__
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 
 OPTIONS = [
@@ -57,6 +58,7 @@ def finetune_arg_parser(subparsers):
 	parser.add_argument("-s", "--seq_len", type=int, default=150, help="maximum sequence len (default: 150)")
 	parser.add_argument("-b", "--batch_size", type=int, default=50, help="number of batch_size (default: 50)")
 	parser.add_argument("--valid_batch", type=int, default=-1, help="number of batch_size in valid set. If it's not given, valid_set batch size is set same as the train_set batch size")
+	parser.add_argument("--valid_subset", type=int, default=10000, help="validation subset size (default: 10000). Use 0 for full set.")
 	parser.add_argument("--corpus_lines", type=int, default=None, help="total number of lines in corpus")
 	
 	# Hyperparams for training
@@ -188,12 +190,22 @@ def run_finetune(args):
 		args.valid_batch = args.batch_size
 
 	test_sampler = None
+	test_shuffle = args.valid_subset > 0
+	if args.test_dataset is not None and args.valid_subset > 0:
+		total_valid = len(test_dataset)
+		subset_size = min(args.valid_subset, total_valid)
+		if subset_size < total_valid:
+			rng = random.Random(args.seed)
+			indices = rng.sample(range(total_valid), subset_size)
+			test_dataset = Subset(test_dataset, indices)
+			print(f"Validation subset: {subset_size} of {total_valid}")
+
 	if use_ddp and args.test_dataset is not None:
 		test_sampler = DistributedSampler(
 			test_dataset,
 			num_replicas=int(os.environ["WORLD_SIZE"]),
 			rank=int(os.environ["RANK"]),
-			shuffle=False,
+			shuffle=test_shuffle,
 			drop_last=True,
 		)
 	test_data_loader = DataLoader(
@@ -201,7 +213,7 @@ def run_finetune(args):
 		batch_size=args.valid_batch,
 		num_workers=args.num_workers,
 		pin_memory=args.with_cuda,
-		shuffle=False,
+		shuffle=test_shuffle if test_sampler is None else False,
 		sampler=test_sampler,
 		drop_last=True if test_sampler is not None else False,
 	) if args.test_dataset is not None else None
