@@ -4,9 +4,7 @@ import os
 import random
 import re
 import sys
-import uuid
 import warnings
-from functools import partial
 from typing import List, Optional
 
 import numpy as np
@@ -19,13 +17,7 @@ from tqdm.auto import tqdm
 from .bam import process_bismark_read, process_dorado_read
 
 
-# https://gist.github.com/EdwinChan/3c13d3a746bb3ec5082f
-def globalize(func):
-  def result(*args, **kwargs):
-    return func(*args, **kwargs)
-  result.__name__ = result.__qualname__ = uuid.uuid4().hex
-  setattr(sys.modules[result.__module__], result.__name__, result)
-  return result
+_READ_EXTRACT_CTX = {}
 
 def kmers(seq: str, k: int=3):
     '''
@@ -55,6 +47,104 @@ def kmers(seq: str, k: int=3):
     return converted_seq, methyl
 
 
+def _reads_overlapping(aln, chromo, start, end, dict_ref: dict, k: int, methyl_caller: str = "bismark"):
+    '''
+    Get reads overlapping with chromo:start-end and convert to k-mers.
+    '''
+
+    if methyl_caller not in ["bismark", "dorado"]:
+        raise ValueError(f"Methylation caller must be one of [bismark, dorado]")
+
+    fetched_reads = aln.fetch(chromo, start, end, until_eof=True)
+    processed_reads = list()
+
+    for read in fetched_reads:
+        # Only select fully overlapping reads
+        if (read.pos  < start) or ((read.pos+read.query_alignment_length) > end):
+            continue
+
+        # Remove case-specific mode occured by the quality
+        ref_seq = dict_ref[chromo][read.pos:(read.pos+read.query_alignment_length)].upper()
+
+        if methyl_caller == "bismark":
+            ref_seq = process_bismark_read(ref_seq, read)
+        elif methyl_caller == "dorado":
+            ref_seq = process_dorado_read(ref_seq, read)
+
+        if ref_seq is None:
+            continue
+
+        # When there is no CpG methylation patterns after processing
+        if "z" not in ref_seq.lower():
+            continue
+
+        # K-mers
+        s, m = kmers(ref_seq, k=k)
+
+        if len(s) != len(m):
+            raise ValueError("DNA and methylation sequences have different length (%d and %d)"%(len(s), len(m)))
+
+        # Add processed results as a tag
+        read.setTag("RF", value=" ".join(s), replace=True) # reference sequence
+        read.setTag("ME", value="".join(m), replace=True) # methylation pattern sequence
+
+        # Process back to a dictionary
+        read_tags = {t:v for t, v in read.get_tags()}
+        read = read.to_dict()
+        read.update(read_tags)
+        processed_reads.append(read)
+
+    processed_reads = pd.DataFrame(processed_reads)
+    if "tags" in processed_reads.keys():
+        processed_reads = processed_reads.drop(columns=["tags"])
+
+    return processed_reads
+
+
+def _get_methylseq_core(dmr, dict_ref: dict, bam_file_path: str, k: int, methyl_caller: str):
+    '''
+    Return a dataframe with DNA/methylation sequences for a given DMR.
+    '''
+    aln = pysam.AlignmentFile(bam_file_path, "rb")
+    try:
+        processed_reads = _reads_overlapping(
+            aln,
+            dmr["chr"], int(dmr["start"]), int(dmr["end"]),
+            dict_ref, k, methyl_caller
+        )
+    finally:
+        aln.close()
+
+    if processed_reads.shape[0] > 0:
+        processed_reads = processed_reads.assign(dmr_ctype=dmr["ctype"],
+                                                 dmr_label=dmr["dmr_id"])
+        return processed_reads
+    return None
+
+
+def _init_read_extract_worker(dict_ref, bam_file_path, k, methyl_caller):
+    global _READ_EXTRACT_CTX
+    _READ_EXTRACT_CTX = {
+        "dict_ref": dict_ref,
+        "bam_file_path": bam_file_path,
+        "k": k,
+        "methyl_caller": methyl_caller,
+    }
+
+
+def _get_methylseq_worker(dmr):
+    ctx = _READ_EXTRACT_CTX
+    if not ctx:
+        raise RuntimeError("read_extract worker context is not initialized.")
+    return _get_methylseq_core(
+        dmr,
+        ctx["dict_ref"],
+        ctx["bam_file_path"],
+        ctx["k"],
+        ctx["methyl_caller"],
+    )
+
+
 def read_extract(bam_file_path: str, dict_ref: dict, k: int, dmrs: pd.DataFrame, ncores: int=1, methyl_caller: str = "bismark"):
     '''
         Extract reads including methylation patterns overlapping with DMRs
@@ -71,88 +161,19 @@ def read_extract(bam_file_path: str, dict_ref: dict, k: int, dmrs: pd.DataFrame,
         ncores: (int)
             Number of cores to be used for parallel processing, default: 1
     '''
-
-    def _reads_overlapping(aln, chromo, start, end, methyl_caller="bismark"):
-        '''
-        seq_list = list()
-        dna_seq = list()
-        xm_tags = list()
-        '''
-
-        if methyl_caller not in ["bismark", "dorado"]:
-            raise ValueError(f"Methylation caller must be one of [bismark, dorado]")
-
-        # get all reads overlapping with chromo:start-end
-        fetched_reads = aln.fetch(chromo, start, end, until_eof=True)
-        processed_reads = list()
-
-        for read in fetched_reads:
-            # Only select fully overlapping reads
-            if (read.pos  < start) or ((read.pos+read.query_alignment_length) > end):
-                continue
-
-            # Remove case-specific mode occured by the quality
-            ref_seq = dict_ref[chromo][read.pos:(read.pos+read.query_alignment_length)].upper()
-
-            if methyl_caller == "bismark":
-                ref_seq = process_bismark_read(ref_seq, read)
-            elif methyl_caller == "dorado":
-                ref_seq = process_dorado_read(ref_seq, read)
-
-            if ref_seq is None:
-                continue
-
-            # When there is no CpG methylation patterns after processing
-            if "z" not in ref_seq.lower():
-                continue
-
-            # K-mers
-            s, m = kmers(ref_seq, k=3)
-
-            if len(s) != len(m):
-                raise ValueError("DNA and methylation sequences have different length (%d and %d)"%(len(s), len(m)))
-
-            # Add processed results as a tag
-            read.setTag("RF", value=" ".join(s), replace=True) # reference sequence
-            read.setTag("ME", value="".join(m), replace=True) # methylation pattern sequence
-
-            # Process back to a dictionary
-            read_tags = {t:v for t, v in read.get_tags()}
-            read = read.to_dict()
-            read.update(read_tags)
-            processed_reads.append(read)
-
-        processed_reads = pd.DataFrame(processed_reads)
-        if "tags" in processed_reads.keys():
-            processed_reads = processed_reads.drop(columns=["tags"])
-
-        return processed_reads
-
-    @globalize
-    def _get_methylseq(dmr, bam_file_path: str, k: int, methyl_caller: str):
-        '''
-            Return a dictionary of DNA seq, cell type and methylation seq processed in a 3-mer seq
-        '''
-        aln = pysam.AlignmentFile(bam_file_path, "rb")
-
-        processed_reads = _reads_overlapping(aln,
-                                             dmr["chr"], int(dmr["start"]), int(dmr["end"]),
-                                             methyl_caller)
-        if processed_reads.shape[0] > 0:
-            processed_reads = processed_reads.assign(dmr_ctype = dmr["ctype"],
-                                                     dmr_label = dmr["dmr_id"])
-            return processed_reads
-
     if ncores > 1:
-        with mp.Pool(ncores) as pool:
+        with mp.Pool(
+            ncores,
+            initializer=_init_read_extract_worker,
+            initargs=(dict_ref, bam_file_path, k, methyl_caller),
+        ) as pool:
             # Convert read sequences to k-mer sequences
-            seqs = pool.map(partial(_get_methylseq,
-                                    bam_file_path = bam_file_path, k=k, methyl_caller=methyl_caller),
-                            dmrs.to_dict("records"))
+            seqs = pool.map(_get_methylseq_worker, dmrs.to_dict("records"))
     else:
-        seqs = [_get_methylseq(dmr, bam_file_path = bam_file_path, k=k,
-                               methyl_caller = methyl_caller)
-                for dmr in dmrs.to_dict("records")]
+        seqs = [
+            _get_methylseq_core(dmr, dict_ref, bam_file_path, k, methyl_caller)
+            for dmr in dmrs.to_dict("records")
+        ]
 
     # Filter None values that means no overlapping read with the given DMR
     seqs = list(filter(lambda i: i is not None, seqs))

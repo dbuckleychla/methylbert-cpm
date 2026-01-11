@@ -26,7 +26,7 @@ def _parse_args():
 	parser.add_argument("--f_ref", type=str, required=True, help="Reference FASTA path")
 	parser.add_argument("--output_dir", type=str, required=True,
 						help="Directory to write one output file per BAM")
-	parser.add_argument("--tmp_root", type=str, default="methylbert_CNS_CPM_outs/bulk",
+	parser.add_argument("--tmp_root", type=str, default="methylbert_deconv_tmp",
 						help="Base directory for temporary bulk preprocessing outputs")
 	parser.add_argument("--gpus", type=str, default="all",
 						help="Comma-separated GPU ids to use, or 'all' (default: all)")
@@ -41,7 +41,7 @@ def _parse_args():
 						help="Bulk output compression (default: snappy)")
 	parser.add_argument("--save_mode", type=str, default="minimal",
 						choices=["full", "minimal"], help="Bulk output column mode (default: minimal)")
-	parser.add_argument("--batch_size", type=int, default=64,
+	parser.add_argument("--batch_size", type=int, default=512,
 						help="Deconvolute batch size (default: 64)")
 	parser.add_argument("--save_logit", action="store_true",
 						help="Save logits from the model (default: False)")
@@ -162,12 +162,6 @@ def _worker(gpu_id, job_queue, result_queue, cfg):
 			)
 			print(f"[gpu {gpu_id}] deconvolute {bam_path} -> {job_out_dir}", flush=True)
 			run_deconvolute(args)
-
-			res_path = job_out_dir / "res.csv.gz"
-			if not res_path.exists():
-				raise FileNotFoundError(f"Expected res.csv.gz missing: {res_path}")
-			res_out = Path(cfg["output_dir"]) / f"{output_stem}.res.csv.gz"
-			shutil.copy2(res_path, res_out)
 
 			deconv_path = job_out_dir / "deconvolution.csv"
 			if not deconv_path.exists():
