@@ -163,6 +163,12 @@ def _worker(gpu_id, job_queue, result_queue, cfg):
 			print(f"[gpu {gpu_id}] deconvolute {bam_path} -> {job_out_dir}", flush=True)
 			run_deconvolute(args)
 
+			res_path = job_out_dir / "res.csv.gz"
+			if not res_path.exists():
+				raise FileNotFoundError(f"Expected res.csv.gz missing: {res_path}")
+			res_out = Path(cfg["output_dir"]) / f"{output_stem}.res.csv.gz"
+			shutil.copy2(res_path, res_out)
+
 			deconv_path = job_out_dir / "deconvolution.csv"
 			if not deconv_path.exists():
 				raise FileNotFoundError(f"Expected deconvolution output missing: {deconv_path}")

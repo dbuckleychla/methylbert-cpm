@@ -664,6 +664,7 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			}
 
 		line = deepcopy(self.lines[index])
+		read_name = line.get("read_name", line.get("name"))
 
 		item = _line2tokens_finetune(
 			l=line,
@@ -682,6 +683,8 @@ class MethylBertFinetuneDataset(MethylBertDataset):
 			item["methyl_seq"][-1] = 2
 		item["dna_seq"] = torch.cat((torch.tensor([self.vocab.sos_index]), item["dna_seq"]))
 		item["methyl_seq"] = torch.cat((torch.tensor([2]), item["methyl_seq"]))
+		if read_name is not None:
+			item["read_name"] = read_name
 
 		return item
 

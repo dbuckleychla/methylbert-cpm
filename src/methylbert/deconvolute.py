@@ -192,13 +192,19 @@ def deconvolute(trainer : MethylBertFinetuneTrainer,
 												tokenizer=tokenizer,
 												logit=True)
 	total_res = total_res.drop(columns=["ctype_label"])
-	if "read_name" not in total_res.columns and "name" in total_res.columns:
-		total_res["read_name"] = total_res["name"]
+	if "read_name" not in total_res.columns:
+		if "name" in total_res.columns:
+			total_res = total_res.rename(columns={"name": "read_name"})
+		else:
+			raise ValueError(
+				"read_name is missing in classification results. "
+				"Ensure bulk preprocessing outputs include read_name."
+			)
 
 	# Save the classification results 
 	total_res["n_cpg"]=total_res["methyl_seq"].apply(lambda x: x.count("0") + x.count("1"))
 	total_res["P_ctype"] = logits[:,1]
-	total_res.to_csv(output_path+"/res.csv", sep="\t", header=True, index=False)
+	total_res.to_csv(output_path+"/res.csv.gz", sep="\t", header=True, index=False, compression="gzip")
 	total_res["P_N"] = logits[:,0]
 	
 	# Select reads which contain methylation patterns 
