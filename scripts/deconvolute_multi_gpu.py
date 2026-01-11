@@ -51,7 +51,7 @@ def _parse_args():
 	parser.add_argument("--keep_tmp", action="store_true",
 						help="Keep temporary bulk preprocessing outputs")
 	parser.add_argument("--keep_all_outputs", action="store_true",
-						help="Keep full deconvolution outputs (res.csv/FI.csv) per BAM")
+						help="Keep full per-BAM deconvolution output directory")
 	return parser.parse_args()
 
 
@@ -163,20 +163,31 @@ def _worker(gpu_id, job_queue, result_queue, cfg):
 			print(f"[gpu {gpu_id}] deconvolute {bam_path} -> {job_out_dir}", flush=True)
 			run_deconvolute(args)
 
+			res_path = job_out_dir / "res.csv.gz"
+			if not res_path.exists():
+				raise FileNotFoundError(f"Expected res.csv.gz missing: {res_path}")
+			res_out = Path(cfg["output_dir"]) / f"{output_stem}_res.csv.gz"
+			shutil.copy2(res_path, res_out)
+
 			deconv_path = job_out_dir / "deconvolution.csv"
 			if not deconv_path.exists():
 				raise FileNotFoundError(f"Expected deconvolution output missing: {deconv_path}")
-			final_out = Path(cfg["output_dir"]) / f"{output_stem}.deconvolution.csv"
-			if cfg["keep_all_outputs"]:
-				shutil.copy2(deconv_path, final_out)
-			else:
-				shutil.move(deconv_path, final_out)
+			deconv_out = Path(cfg["output_dir"]) / f"{output_stem}_deconvolution.csv"
+			shutil.copy2(deconv_path, deconv_out)
+
+			fi_path = job_out_dir / "FI.csv"
+			if not fi_path.exists():
+				raise FileNotFoundError(f"Expected FI.csv missing: {fi_path}")
+			fi_out = Path(cfg["output_dir"]) / f"{output_stem}_FI.csv"
+			shutil.copy2(fi_path, fi_out)
+
+			if not cfg["keep_all_outputs"]:
 				shutil.rmtree(job_out_dir, ignore_errors=True)
 
 			if not cfg["keep_tmp"]:
 				shutil.rmtree(tmp_dir, ignore_errors=True)
 
-			result_queue.put((bam_path, True, str(final_out)))
+			result_queue.put((bam_path, True, str(deconv_out)))
 		except Exception as exc:
 			result_queue.put((bam_path, False, str(exc)))
 
